@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:latest
+    container_name: campaign_mongodb
+    restart: always
+    ports:
+      - "27099:27017"
+    volumes:
+      - mongodb_data:/data/db
+
+  redis:
+    image: redis:7-alpine
+    container_name: campaign_redis
+    restart: always
+    ports:
+      - "6399:6379"
+    volumes:
+      - redis_data:/data
+
+  backend-api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: campaign_backend_api
+    restart: always
+    ports:
+      - "8099:8000"
+    environment:
+      - MONGODB_URL=mongodb://mongodb:27017
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_NAME=social_campaign_db
+      - JWT_SECRET=supersecretkeyforcampaignmanagementsystem123456!
+    depends_on:
+      - mongodb
+      - redis
+
+  backend-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: campaign_backend_worker
+    restart: always
+    command: python -m app.workers.worker
+    environment:
+      - MONGODB_URL=mongodb://mongodb:27017
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_NAME=social_campaign_db
+    depends_on:
+      - mongodb
+      - redis
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: campaign_frontend
+    restart: always
+    ports:
+      - "3099:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://127.0.0.1:8099
+    depends_on:
+      - backend-api
+
+volumes:
+  mongodb_data:
+  redis_data:

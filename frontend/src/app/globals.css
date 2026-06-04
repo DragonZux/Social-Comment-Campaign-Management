@@ -1,0 +1,133 @@
+@import "tailwindcss";
+
+:root {
+  --background: #FAFAFB;
+  --foreground: #0F172A;
+  --flat-primary: #3B82F6;
+  --flat-secondary: #10B981;
+  --flat-accent: #F59E0B;
+  --flat-muted: #F8FAFC;
+  --flat-border: #E2E8F0;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-outfit), sans-serif;
+  min-height: 100vh;
+  margin: 0;
+  overflow-x: hidden;
+}
+
+/* Custom scrollbar for premium look */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}
+
+/* Animations */
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pulseGlow {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4);
+  }
+  50% {
+    transform: scale(1.05);
+    box-shadow: 0 0 0 6px rgba(16, 185, 129, 0);
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.animate-slide-up {
+  animation: slideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-pulse-glow {
+  animation: pulseGlow 2s infinite ease-in-out;
+}
+
+.animate-shimmer {
+  background: linear-gradient(90deg, #F1F5F9 25%, #E2E8F0 50%, #F1F5F9 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite linear;
+}
+
+/* Glassmorphism panel */
+.glass-panel {
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+/* Clear shadow utility */
+.shadow-none {
+  box-shadow: none !important;
+}
+
+/* Snappy instant hover transformations */
+.flat-hover-btn {
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.flat-hover-btn:hover {
+  transform: translateY(-2px);
+}
+
+.flat-hover-card {
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.flat-hover-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 12px 20px -8px rgba(0, 0, 0, 0.05);
+  border-color: #CBD5E1;
+}
+
+/* Theme configurations */
+@theme inline {
+  --font-sans: var(--font-outfit), sans-serif;
+  --color-canvas: var(--background);
+  --color-flatText: var(--foreground);
+  --color-flatPrimary: var(--flat-primary);
+  --color-flatSecondary: var(--flat-secondary);
+  --color-flatAccent: var(--flat-accent);
+  --color-flatMuted: var(--flat-muted);
+  --color-flatBorder: var(--flat-border);
+}
+
+/* Accessibility settings for reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after {
+    transform: none !important;
+    transition: none !important;
+    animation: none !important;
+  }
+}
+

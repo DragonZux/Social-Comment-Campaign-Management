@@ -1,6 +1,6 @@
 import logging
 import redis.asyncio as redis
-from app.config import settings
+from app.core.config import settings
 
 logger = logging.getLogger("app.queue_service")
 

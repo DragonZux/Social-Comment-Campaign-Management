@@ -4,13 +4,13 @@ from datetime import datetime
 from typing import List, Optional
 import random
 
-from app.database import get_db
-from app.models import (
+from app.db.database import get_db
+from app.schemas import (
     CampaignCreate, CampaignUpdate, CampaignOut,
     TargetURLImport, TargetURLOut, CommentTemplateImport, CommentTemplateOut,
     serialize_doc, serialize_docs
 )
-from app.routes.auth import get_current_user, require_roles, write_audit_log
+from app.api.routes.auth import get_current_user, require_roles, write_audit_log
 from app.services.queue_service import queue_service
 
 router = APIRouter(prefix="/campaigns", tags=["Campaigns"])

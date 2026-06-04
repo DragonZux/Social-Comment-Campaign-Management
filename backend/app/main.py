@@ -2,11 +2,10 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from passlib.hash import bcrypt
 
-from app.config import settings
-from app.database import connect_to_mongo, close_mongo_connection, get_db
-from app.routes import auth, accounts, campaigns, jobs, dashboard
+from app.api.routes import accounts, auth, campaigns, dashboard, jobs
+from app.db.database import close_mongo_connection, connect_to_mongo
+from app.seed import seed_data
 from app.services.queue_service import queue_service
 
 # Configure logging
@@ -15,81 +14,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("app.main")
-
-async def seed_data():
-    db = get_db()
-    
-    # 1. Check if we need to seed users
-    users_count = await db.users.count_documents({})
-    if users_count == 0:
-        logger.info("Database is empty. Seeding initial development data...")
-        
-        # Seed users
-        admin_hash = bcrypt.hash("admin123")
-        operator_hash = bcrypt.hash("operator123")
-        
-        await db.users.insert_many([
-            {
-                "username": "admin",
-                "hashed_password": admin_hash,
-                "role": "ADMIN",
-                "created_at": datetime.utcnow()
-            },
-            {
-                "username": "operator",
-                "hashed_password": operator_hash,
-                "role": "OPERATOR",
-                "created_at": datetime.utcnow()
-            }
-        ])
-        logger.info("Seeded users (admin/admin123, operator/operator123)")
-        
-        # Seed accounts
-        await db.accounts.insert_many([
-            {
-                "platform": "X",
-                "username": "tech_guru",
-                "display_name": "Tech Guru X",
-                "status": "ACTIVE",
-                "daily_limit": 100,
-                "hourly_limit": 10,
-                "daily_usage_count": 0,
-                "hourly_usage_count": 0,
-                "last_activity": None,
-                "health_score": 100,
-                "created_at": datetime.utcnow()
-            },
-            {
-                "platform": "X",
-                "username": "crypto_news",
-                "display_name": "Crypto Alerts",
-                "status": "ACTIVE",
-                "daily_limit": 50,
-                "hourly_limit": 5,
-                "daily_usage_count": 0,
-                "hourly_usage_count": 0,
-                "last_activity": None,
-                "health_score": 95,
-                "created_at": datetime.utcnow()
-            },
-            {
-                "platform": "Threads",
-                "username": "lifestyle_vlog",
-                "display_name": "Lifestyle Threads",
-                "status": "ACTIVE",
-                "daily_limit": 20,
-                "hourly_limit": 3,
-                "daily_usage_count": 0,
-                "hourly_usage_count": 0,
-                "last_activity": None,
-                "health_score": 100,
-                "created_at": datetime.utcnow()
-            }
-        ])
-        logger.info("Seeded initial social accounts")
-
-# We import datetime inside main for seeding
-from datetime import datetime
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -115,7 +39,12 @@ app = FastAPI(
 # Set CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, configure to Next.js domain
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3099",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3099",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

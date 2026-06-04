@@ -3,9 +3,9 @@ from bson import ObjectId
 from datetime import datetime
 from typing import Dict, Any, List
 
-from app.database import get_db
-from app.models import DashboardMetrics, AuditLogOut, serialize_docs
-from app.routes.auth import get_current_user, require_roles
+from app.db.database import get_db
+from app.schemas import DashboardMetrics, AuditLogOut, serialize_docs
+from app.api.routes.auth import get_current_user, require_roles
 from app.services.queue_service import queue_service
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
@@ -132,4 +132,3 @@ async def get_audit_logs(
     cursor = db.audit_logs.find({}).sort("created_at", -1).limit(100)
     logs = await cursor.to_list(length=100)
     return serialize_docs(logs)
-

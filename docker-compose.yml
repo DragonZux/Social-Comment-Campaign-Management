@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   mongodb:
-    image: mongo:6.0
+    image: mongo:latest
     container_name: campaign_mongodb
     restart: always
     ports:
@@ -39,9 +39,10 @@ services:
   backend-worker:
     build:
       context: ./backend
-      dockerfile: Dockerfile.worker
+      dockerfile: Dockerfile
     container_name: campaign_backend_worker
     restart: always
+    command: python -m app.workers.worker
     environment:
       - MONGODB_URL=mongodb://mongodb:27017
       - REDIS_URL=redis://redis:6379/0
@@ -59,7 +60,7 @@ services:
     ports:
       - "3099:3000"
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8099
+      - NEXT_PUBLIC_API_URL=http://127.0.0.1:8099
     depends_on:
       - backend-api
 

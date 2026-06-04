@@ -5,7 +5,7 @@ import redis.asyncio as redis
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 
-from app.config import settings
+from app.core.config import settings
 from app.services.social_mock import mock_post_comment
 
 # Configure logging for worker
@@ -242,7 +242,8 @@ class Worker:
                 platform=campaign["platform"],
                 username=account["username"],
                 target_url=url_doc["url"],
-                comment_content=template_doc["content"]
+                comment_content=template_doc["content"],
+                cookie=account.get("cookie")
             )
             
             # Success!

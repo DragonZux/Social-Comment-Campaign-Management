@@ -3,9 +3,9 @@ from bson import ObjectId
 from datetime import datetime
 from typing import List, Optional
 
-from app.database import get_db
-from app.models import JobOut, serialize_doc, serialize_docs
-from app.routes.auth import get_current_user, require_roles, write_audit_log
+from app.db.database import get_db
+from app.schemas import JobOut, serialize_doc, serialize_docs
+from app.api.routes.auth import get_current_user, require_roles, write_audit_log
 from app.services.queue_service import queue_service
 
 router = APIRouter(prefix="/jobs", tags=["Jobs"])

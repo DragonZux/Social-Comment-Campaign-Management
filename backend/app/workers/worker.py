@@ -22,6 +22,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("worker")
 
+IMMEDIATE_QUEUE = "campaign_jobs_queue"
+SCHEDULED_QUEUE = "campaign_jobs_scheduled"
+
 def spin_spintax(text: str) -> str:
     """
     Parses and spins spintax format like {hello|hi|hey} into a random choice.
@@ -42,6 +45,7 @@ class Worker:
         self.mongo_client = None
         self.db = None
         self.running = True
+        self.last_monitor_check = 0.0
 
     async def connect(self):
         logger.info(f"Connecting to MongoDB at {settings.MONGODB_URL}")
@@ -104,6 +108,7 @@ class Worker:
         
         if attempt <= 3:
             delay = delays[attempt - 1]
+            run_at = datetime.utcnow() + timedelta(seconds=delay)
             logger.info(f"Scheduling job {job_id_str} for retry #{attempt} in {delay}s due to error: {error_msg}")
             
             # Update job status in database
@@ -112,22 +117,11 @@ class Worker:
                 {"$set": {
                     "status": "RETRYING",
                     "attempt_count": attempt,
+                    "scheduled_time": run_at,
                     "error_message": f"Retry #{attempt}: {error_msg}"
                 }}
             )
-            
-            # We schedule the enqueue operation after 'delay' seconds using asyncio.create_task
-            async def delayed_enqueue():
-                await asyncio.sleep(delay)
-                # Re-queue job
-                await db.jobs.update_one(
-                    {"_id": ObjectId(job_id_str)},
-                    {"$set": {"status": "QUEUED"}}
-                )
-                await self.redis_client.rpush("campaign_jobs_queue", job_id_str)
-                logger.info(f"Re-enqueued job {job_id_str} after delay of {delay}s")
-                
-            asyncio.create_task(delayed_enqueue())
+            await self.redis_client.zadd(SCHEDULED_QUEUE, {job_id_str: run_at.timestamp()})
         else:
             # Max retries exceeded
             logger.error(f"Job {job_id_str} failed after max retries. Error: {error_msg}")
@@ -165,6 +159,70 @@ class Worker:
                         {"_id": account_id},
                         {"$set": {"health_score": new_score, "status": status_val}}
                     )
+
+    async def postpone_for_rate_limit(self, job_id_str: str, job: dict, account: dict):
+        now = datetime.utcnow()
+        hourly_limited = account["hourly_usage_count"] >= account["hourly_limit"]
+        daily_limited = account["daily_usage_count"] >= account["daily_limit"]
+
+        if daily_limited:
+            run_at = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+        elif hourly_limited:
+            run_at = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
+        else:
+            run_at = now + timedelta(minutes=5)
+
+        message = f"Rate limit reached for @{account['username']}. Rescheduled for {run_at.isoformat()} UTC."
+        await self.db.accounts.update_one({"_id": account["_id"]}, {"$set": {"status": "LIMITED"}})
+        await self.db.jobs.update_one(
+            {"_id": ObjectId(job_id_str)},
+            {"$set": {
+                "status": "RETRYING",
+                "scheduled_time": run_at,
+                "error_message": message
+            }}
+        )
+        await self.redis_client.zadd(SCHEDULED_QUEUE, {job_id_str: run_at.timestamp()})
+        logger.warning(message)
+
+    async def enqueue_due_scheduled_jobs(self):
+        now_ts = datetime.utcnow().timestamp()
+        job_ids = await self.redis_client.zrangebyscore(SCHEDULED_QUEUE, 0, now_ts, start=0, num=100)
+        due_from_db = await self.db.jobs.find({
+            "status": "RETRYING",
+            "scheduled_time": {"$lte": datetime.utcnow()}
+        }, {"_id": 1}).to_list(length=100)
+        db_job_ids = [str(job["_id"]) for job in due_from_db]
+        job_ids = list(dict.fromkeys([*job_ids, *db_job_ids]))
+        if not job_ids:
+            return
+
+        await self.redis_client.zrem(SCHEDULED_QUEUE, *job_ids)
+        for job_id_str in job_ids:
+            if not ObjectId.is_valid(job_id_str):
+                continue
+
+            job = await self.db.jobs.find_one({"_id": ObjectId(job_id_str)})
+            if not job or job.get("status") != "RETRYING":
+                continue
+
+            campaign = await self.db.campaigns.find_one({"_id": job["campaign_id"]})
+            if not campaign:
+                await self.db.jobs.update_one({"_id": job["_id"]}, {"$set": {"status": "CANCELLED"}})
+                continue
+            if campaign["status"] == "PAUSED":
+                await self.db.jobs.update_one({"_id": job["_id"]}, {"$set": {"status": "PENDING"}})
+                continue
+            if campaign["status"] != "RUNNING":
+                await self.db.jobs.update_one({"_id": job["_id"]}, {"$set": {"status": "CANCELLED"}})
+                continue
+
+            await self.db.jobs.update_one(
+                {"_id": job["_id"], "status": "RETRYING"},
+                {"$set": {"status": "QUEUED"}}
+            )
+            await self.redis_client.rpush(IMMEDIATE_QUEUE, job_id_str)
+            logger.info(f"Moved due scheduled job {job_id_str} back to the immediate queue")
 
     async def handle_permanent_account_error(self, job_id_str: str, job: dict, account: dict, error_msg: str):
         """Fail unrecoverable account/session errors without retrying the same bad cookie."""
@@ -207,10 +265,15 @@ class Worker:
         
         if remaining == 0:
             logger.info(f"All jobs for campaign {campaign_id} completed. Finalizing campaign status...")
+            failed = await self.db.jobs.count_documents({
+                "campaign_id": campaign_id,
+                "status": "FAILED"
+            })
+            next_status = "FAILED" if failed else "COMPLETED"
             await self.db.campaigns.update_one(
-                {"_id": campaign_id},
+                {"_id": campaign_id, "status": "RUNNING"},
                 {"$set": {
-                    "status": "COMPLETED",
+                    "status": next_status,
                     "end_time": datetime.utcnow()
                 }}
             )
@@ -263,11 +326,7 @@ class Worker:
         if account["hourly_usage_count"] >= account["hourly_limit"] or account["daily_usage_count"] >= account["daily_limit"]:
             logger.warning(f"Account @{account['username']} hit rate limits. Hourly: {account['hourly_usage_count']}/{account['hourly_limit']}, Daily: {account['daily_usage_count']}/{account['daily_limit']}")
             
-            # Temporarily mark account status as LIMITED
-            await db.accounts.update_one({"_id": account["_id"]}, {"$set": {"status": "LIMITED"}})
-            
-            # Postpone/Retry this job (wait 5 mins)
-            await self.handle_retry(job_id_str, job, f"Rate limits exceeded for account @{account['username']}.")
+            await self.postpone_for_rate_limit(job_id_str, job, account)
             await self.check_campaign_completion(campaign_id)
             return
 
@@ -323,6 +382,29 @@ class Worker:
                 access_token=account.get("access_token"),
                 threads_user_id=account.get("threads_user_id"),
             )
+
+            latest_campaign = await db.campaigns.find_one({"_id": campaign_id})
+            latest_job = await db.jobs.find_one({"_id": ObjectId(job_id_str)})
+            if not latest_campaign or latest_campaign["status"] != "RUNNING" or latest_job.get("status") == "CANCELLED":
+                now = datetime.utcnow()
+                await db.jobs.update_one(
+                    {"_id": ObjectId(job_id_str), "status": {"$ne": "SUCCESS"}},
+                    {"$set": {
+                        "status": "CANCELLED",
+                        "completed_at": now,
+                        "error_message": "Campaign stopped before the worker could finalize the job."
+                    }}
+                )
+                await db.target_urls.update_one(
+                    {"_id": url_doc["_id"], "status": {"$ne": "SUCCESS"}},
+                    {"$set": {
+                        "status": "SKIPPED",
+                        "processed_at": now,
+                        "error_message": "Campaign stopped by user"
+                    }}
+                )
+                await self.check_campaign_completion(campaign_id)
+                return
             
             # Success!
             now = datetime.utcnow()
@@ -365,15 +447,162 @@ class Worker:
         # Check if campaign has finished
         await self.check_campaign_completion(campaign_id)
 
+    async def monitor_campaign_fetch_and_enqueue(self, campaign):
+        db = self.db
+        campaign_id = campaign["_id"]
+        platform = campaign["platform"]
+        page_url = campaign.get("monitor_page_url")
+        if not page_url:
+            return
+
+        # Fetch active accounts
+        accounts_query = {
+            "platform": platform,
+            "status": "ACTIVE",
+            "owner_id": campaign["owner_id"]
+        }
+        accounts = await db.accounts.find(accounts_query).to_list(length=100)
+        
+        # Filter valid accounts (with cookies)
+        from app.services.social_mock import parse_cookie_to_dict
+        valid_accounts = []
+        for account in accounts:
+            cookies = parse_cookie_to_dict(account.get("cookie"))
+            if platform == "X":
+                valid = bool(cookies.get("auth_token") and cookies.get("ct0"))
+            else:
+                valid = bool(
+                    account.get("access_token") and account.get("threads_user_id")
+                ) or bool(cookies.get("sessionid") or cookies.get("session_id"))
+            if valid:
+                valid_accounts.append(account)
+
+        if not valid_accounts:
+            logger.error(f"Cannot monitor campaign '{campaign['name']}': No active accounts with valid cookies.")
+            return
+
+        # Get all existing target URLs for this campaign
+        existing_urls_cursor = db.target_urls.find({"campaign_id": campaign_id}, {"url": 1})
+        existing_urls = [doc["url"] for doc in await existing_urls_cursor.to_list(length=1000)]
+        
+        # Use first valid account for scraping
+        test_account = valid_accounts[0]
+        
+        # Call simulation/scraping helper to fetch the single latest post
+        from app.services.social_mock import mock_fetch_latest_post
+        latest_post = await mock_fetch_latest_post(
+            platform, 
+            page_url, 
+            existing_urls, 
+            cookie_str=test_account.get("cookie"), 
+            proxy=test_account.get("proxy")
+        )
+        
+        if latest_post in existing_urls:
+            logger.info(f"Latest post is already processed for monitored campaign '{campaign['name']}'")
+            return
+            
+        logger.info(f"Found new latest post for monitored campaign '{campaign['name']}': {latest_post}. Processing...")
+        
+        # Fetch templates
+        templates = await db.comment_templates.find({"campaign_id": campaign_id, "status": "ACTIVE"}).to_list(length=100)
+        if not templates:
+            logger.error(f"Cannot process new posts for campaign '{campaign['name']}': No active comment templates.")
+            return
+            
+        total_existing_count = len(existing_urls)
+        
+        # 1. Insert into target_urls
+        url_doc = {
+            "campaign_id": campaign_id,
+            "url": latest_post,
+            "platform": platform,
+            "status": "PROCESSING",
+            "processed_at": None,
+            "error_message": None,
+            "created_at": datetime.utcnow()
+        }
+        result_url = await db.target_urls.insert_one(url_doc)
+        url_id = result_url.inserted_id
+        
+        # 2. Select account and template (round-robin style)
+        account = valid_accounts[total_existing_count % len(valid_accounts)]
+        template = templates[total_existing_count % len(templates)]
+        
+        # 3. Create job
+        job_doc = {
+            "campaign_id": campaign_id,
+            "account_id": account["_id"],
+            "url_id": url_id,
+            "template_id": template["_id"],
+            "status": "QUEUED",
+            "attempt_count": 0,
+            "scheduled_time": datetime.utcnow(),
+            "started_at": None,
+            "completed_at": None,
+            "error_message": None,
+            "created_at": datetime.utcnow()
+        }
+        result_job = await db.jobs.insert_one(job_doc)
+        job_id_str = str(result_job.inserted_id)
+        
+        # 4. Enqueue to Redis
+        await self.redis_client.rpush(IMMEDIATE_QUEUE, job_id_str)
+        logger.info(f"Enqueued job {job_id_str} for monitored new post: {latest_post}")
+
+    async def check_monitored_campaigns(self):
+        db = self.db
+        now = datetime.utcnow()
+        cursor = db.campaigns.find({
+            "campaign_type": "MONITOR",
+            "status": "RUNNING"
+        })
+        async for campaign in cursor:
+            campaign_id = campaign["_id"]
+            interval_mins = campaign.get("monitor_interval", 15)
+            last_monitored = campaign.get("last_monitored_at")
+            
+            should_check = False
+            if not last_monitored:
+                should_check = True
+            else:
+                if isinstance(last_monitored, str):
+                    try:
+                        last_monitored = datetime.fromisoformat(last_monitored)
+                    except ValueError:
+                        last_monitored = now
+                if now - last_monitored >= timedelta(minutes=interval_mins):
+                    should_check = True
+            
+            if should_check:
+                logger.info(f"Checking monitored page for campaign '{campaign['name']}' ({campaign_id})")
+                try:
+                    await self.monitor_campaign_fetch_and_enqueue(campaign)
+                except Exception as e:
+                    logger.error(f"Error monitoring campaign {campaign_id}: {e}")
+                
+                # Update last_monitored_at
+                await db.campaigns.update_one(
+                    {"_id": campaign_id},
+                    {"$set": {"last_monitored_at": datetime.utcnow()}}
+                )
+
     async def run(self):
         await self.connect()
         logger.info("Worker listening for campaign jobs...")
         
         while self.running:
             try:
+                # Run monitoring check every 10 seconds
+                now_ts = datetime.utcnow().timestamp()
+                if now_ts - self.last_monitor_check >= 10:
+                    self.last_monitor_check = now_ts
+                    await self.check_monitored_campaigns()
+
+                await self.enqueue_due_scheduled_jobs()
                 # BLPOP block for 5 seconds waiting for next job ID
                 # Returns (queue_name, item)
-                res = await self.redis_client.blpop("campaign_jobs_queue", timeout=5)
+                res = await self.redis_client.blpop(IMMEDIATE_QUEUE, timeout=5)
                 if res:
                     queue_name, job_id_str = res
                     logger.info(f"Dequeued job {job_id_str} from {queue_name}")

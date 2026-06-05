@@ -38,7 +38,7 @@ async def get_dashboard_metrics(
         campaign_distribution[item["_id"]] = item["count"]
         
     # Standardize statuses
-    for status_name in ["DRAFT", "READY", "RUNNING", "PAUSED", "COMPLETED", "FAILED", "ARCHIVED"]:
+    for status_name in ["DRAFT", "READY", "RUNNING", "PAUSED", "COMPLETED", "FAILED", "STOPPED", "ARCHIVED"]:
         if status_name not in campaign_distribution:
             campaign_distribution[status_name] = 0
             
@@ -58,7 +58,8 @@ async def get_dashboard_metrics(
         if finished_jobs > 0:
             success_rate = round((total_success_jobs / finished_jobs) * 100, 2)
             
-    # 5. Queue Size from Redis
+    # 5. Queue Size from DB. This includes immediate queued jobs; scheduled retries
+    # remain visible through their RETRYING status until they become due.
     queue_size = await db.jobs.count_documents({**job_query, "status": "QUEUED"})
     
     # 6. Average processing time

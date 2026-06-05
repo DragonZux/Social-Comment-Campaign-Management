@@ -2,6 +2,7 @@ from app.schemas.accounts import AccountCreate, AccountOut, AccountUpdate
 from app.schemas.audit import AuditLogOut
 from app.schemas.auth import Token, UserLogin, UserRegister
 from app.schemas.campaigns import (
+    AssignAccountToURL,
     CampaignCreate,
     CampaignOut,
     CampaignUpdate,
@@ -18,6 +19,7 @@ __all__ = [
     "AccountCreate",
     "AccountOut",
     "AccountUpdate",
+    "AssignAccountToURL",
     "AuditLogOut",
     "CampaignCreate",
     "CampaignOut",

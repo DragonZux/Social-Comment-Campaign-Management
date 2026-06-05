@@ -147,8 +147,8 @@ export default function Dashboard() {
   const filteredJobs = metrics.recent_jobs.filter((job) => {
     const isPlatformMatch =
       filterPlatform === "ALL" ||
-      (filterPlatform === "THREADS" && job.target_url?.includes("threads.net")) ||
-      (filterPlatform === "X" && !job.target_url?.includes("threads.net"));
+      (filterPlatform === "THREADS" && (job.target_url?.includes("threads.net") || job.target_url?.includes("threads.com"))) ||
+      (filterPlatform === "X" && !(job.target_url?.includes("threads.net") || job.target_url?.includes("threads.com")));
 
     const isStatusMatch = filterStatus === "ALL" || job.status === filterStatus;
 
@@ -412,7 +412,7 @@ export default function Dashboard() {
                 </tr>
               ) : (
                 filteredJobs.map((job) => {
-                  const isThreads = job.target_url?.includes("threads.net");
+                  const isThreads = job.target_url?.includes("threads.net") || job.target_url?.includes("threads.com");
                   return (
                     <tr key={job.id} className="hover:bg-slate-50/50 transition-colors duration-150">
                       <td className="py-3.5 px-4 font-mono text-[10px] text-slate-400">

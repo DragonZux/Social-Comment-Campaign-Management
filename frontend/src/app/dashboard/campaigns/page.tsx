@@ -29,11 +29,11 @@ const extractUrlsFromText = (value, platform) => {
   const normalized = urlMatches
     .map((url) => url.replace(/[),.;\]]+$/, ""))
     .map((url) => (url.startsWith("http") ? url : `https://${url}`))
-    // Automatically normalize threads.com to threads.net domain
-    .map((url) => url.replace(/threads\.com/i, "threads.net"))
+    .map((url) => url.replace(/^https:\/\/threads\.com\//i, "https://www.threads.com/"))
+    .map((url) => url.replace(/^https:\/\/threads\.net\//i, "https://www.threads.net/"))
     .filter((url) => {
       if (platform === "X") return /https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\//i.test(url);
-      if (platform === "Threads") return /https?:\/\/(?:www\.)?threads\.net\//i.test(url);
+      if (platform === "Threads") return /https?:\/\/(?:www\.)?threads\.(?:net|com)\//i.test(url);
       return true;
     });
 
@@ -70,11 +70,15 @@ export default function Campaigns() {
   const [campaignUrls, setCampaignUrls] = useState([]);
   const [campaignTemplates, setCampaignTemplates] = useState([]);
   const [campaignJobs, setCampaignJobs] = useState([]);
+  const [platformAccounts, setPlatformAccounts] = useState([]);
   
   // Form and Modal States
   const [newCampaignName, setNewCampaignName] = useState("");
   const [newCampaignPlatform, setNewCampaignPlatform] = useState("X");
   const [newCampaignDesc, setNewCampaignDesc] = useState("");
+  const [newCampaignType, setNewCampaignType] = useState("STATIC");
+  const [newMonitorPageUrl, setNewMonitorPageUrl] = useState("");
+  const [newMonitorInterval, setNewMonitorInterval] = useState(15);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [bulkUrls, setBulkUrls] = useState("");
   const [bulkTemplates, setBulkTemplates] = useState("");
@@ -135,6 +139,9 @@ export default function Campaigns() {
       setCampaignTemplates(tpls);
       const jobs = await apiFetch(`/api/jobs?campaign_id=${campaign.id}`);
       setCampaignJobs(jobs);
+      // Load accounts for the campaign's platform
+      const accs = await apiFetch(`/api/accounts?platform=${updated.platform}`);
+      setPlatformAccounts(accs);
     } catch (err) {
       console.warn(err);
     }
@@ -177,12 +184,18 @@ export default function Campaigns() {
         body: JSON.stringify({
           name: newCampaignName,
           platform: newCampaignPlatform,
-          description: newCampaignDesc
+          description: newCampaignDesc,
+          campaign_type: newCampaignType,
+          monitor_page_url: newCampaignType === "MONITOR" ? newMonitorPageUrl : null,
+          monitor_interval: newCampaignType === "MONITOR" ? newMonitorInterval : null,
         })
       });
       showToast("Tạo chiến dịch thành công!");
       setNewCampaignName("");
       setNewCampaignDesc("");
+      setNewCampaignType("STATIC");
+      setNewMonitorPageUrl("");
+      setNewMonitorInterval(15);
       setShowCreateModal(false);
       loadCampaigns();
       setSelectedCampaign(res);
@@ -232,6 +245,14 @@ export default function Campaigns() {
   };
 
   const startCampaign = async (cid) => {
+    if (selectedCampaign?.campaign_type !== "MONITOR" && campaignUrls.length === 0) {
+      showToast("Vui lòng nhập ít nhất một link bài viết trước khi chạy chiến dịch.", "error");
+      return;
+    }
+    if (campaignTemplates.length === 0) {
+      showToast("Vui lòng nhập ít nhất một nội dung comment trước khi chạy chiến dịch.", "error");
+      return;
+    }
     try {
       const res = await apiFetch(`/api/campaigns/${cid}/start`, { method: "POST" });
       showToast("Đã kích hoạt chạy chiến dịch thành công!");
@@ -296,9 +317,40 @@ export default function Campaigns() {
     }
   };
 
+  const assignAccountToUrl = async (urlId, accountId) => {
+    try {
+      await apiFetch(`/api/campaigns/${selectedCampaign.id}/urls/${urlId}/assign-account`, {
+        method: "PUT",
+        body: JSON.stringify({ account_id: accountId || null })
+      });
+      showToast(accountId ? "Đã gán tài khoản cho bài viết!" : "Đã bỏ gán tài khoản.");
+      // Refresh URLs to get updated assignment
+      const urls = await apiFetch(`/api/campaigns/${selectedCampaign.id}/urls`);
+      setCampaignUrls(urls);
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  };
+
+  const assignAccountToAll = async (accountId) => {
+    try {
+      await apiFetch(`/api/campaigns/${selectedCampaign.id}/urls/assign-account-all`, {
+        method: "PUT",
+        body: JSON.stringify({ account_id: accountId || null })
+      });
+      showToast(accountId ? "Đã gán tài khoản cho tất cả bài viết!" : "Đã bỏ gán tất cả.");
+      const urls = await apiFetch(`/api/campaigns/${selectedCampaign.id}/urls`);
+      setCampaignUrls(urls);
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  };
+
   const getStatusText = (s) => {
     if (s === "RUNNING") return "Đang chạy";
     if (s === "COMPLETED") return "Hoàn thành";
+    if (s === "STOPPED") return "Đã dừng";
+    if (s === "FAILED") return "Thất bại";
     if (s === "PAUSED") return "Tạm dừng";
     if (s === "DRAFT") return "Bản nháp";
     if (s === "READY") return "Sẵn sàng";
@@ -375,6 +427,10 @@ export default function Campaigns() {
                       ? "bg-blue-50 text-blue-700 border border-blue-200"
                       : camp.status === "COMPLETED"
                       ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                      : camp.status === "FAILED"
+                      ? "bg-red-50 text-red-700 border border-red-200"
+                      : camp.status === "STOPPED"
+                      ? "bg-slate-100 text-slate-700 border border-slate-200"
                       : camp.status === "PAUSED"
                       ? "bg-amber-50 text-amber-700 border border-amber-200"
                       : "bg-gray-100 text-gray-600 border border-gray-200"
@@ -474,6 +530,116 @@ export default function Campaigns() {
               </div>
             </div>
 
+            {/* Campaign Configuration Panel (Editable when DRAFT, READY, PAUSED) */}
+            {(selectedCampaign.status === "DRAFT" || selectedCampaign.status === "READY" || selectedCampaign.status === "PAUSED") ? (
+              <div className="bg-white border border-gray-200 p-5 rounded-md text-xs font-bold text-gray-600 space-y-4 shadow-none">
+                <h4 className="text-xs font-extrabold uppercase tracking-widest text-gray-500 border-b pb-2">Cấu hình giám sát & Thông tin</h4>
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block mb-1.5 ml-0.5 text-gray-500">Loại chiến dịch</label>
+                    <select
+                      value={selectedCampaign.campaign_type || "STATIC"}
+                      onChange={async (e) => {
+                        const newType = e.target.value;
+                        try {
+                          await apiFetch(`/api/campaigns/${selectedCampaign.id}`, {
+                            method: "PATCH",
+                            body: JSON.stringify({ campaign_type: newType })
+                          });
+                          showToast("Cập nhật loại chiến dịch thành công!");
+                          const updated = await apiFetch(`/api/campaigns/${selectedCampaign.id}`);
+                          setSelectedCampaign(updated);
+                        } catch (err: any) {
+                          showToast(err.message, "error");
+                        }
+                      }}
+                      className="w-full h-10 bg-gray-55 border border-gray-200 rounded px-3 text-xs font-bold text-gray-900 focus:bg-white focus:outline-none cursor-pointer"
+                    >
+                      <option value="STATIC">Thủ công (Nhập bài đăng trực tiếp)</option>
+                      <option value="MONITOR">Tự động (Giám sát trang bài viết mới nhất)</option>
+                    </select>
+                  </div>
+
+                  {selectedCampaign.campaign_type === "MONITOR" && (
+                    <div>
+                      <label className="block mb-1.5 ml-0.5 text-gray-500">Tần suất kiểm tra</label>
+                      <select
+                        value={selectedCampaign.monitor_interval || 15}
+                        onChange={async (e) => {
+                          const newInt = Number(e.target.value);
+                          try {
+                            await apiFetch(`/api/campaigns/${selectedCampaign.id}`, {
+                              method: "PATCH",
+                              body: JSON.stringify({ monitor_interval: newInt })
+                            });
+                            showToast("Cập nhật tần suất kiểm tra thành công!");
+                            const updated = await apiFetch(`/api/campaigns/${selectedCampaign.id}`);
+                            setSelectedCampaign(updated);
+                          } catch (err: any) {
+                            showToast(err.message, "error");
+                          }
+                        }}
+                        className="w-full h-10 bg-gray-55 border border-gray-200 rounded px-3 text-xs font-bold text-gray-900 focus:bg-white focus:outline-none cursor-pointer"
+                      >
+                        <option value={1}>1 phút (Để test nhanh)</option>
+                        <option value={5}>5 phút</option>
+                        <option value={15}>15 phút</option>
+                        <option value={30}>30 phút</option>
+                        <option value={60}>1 giờ</option>
+                      </select>
+                    </div>
+                  )}
+                </div>
+
+                {selectedCampaign.campaign_type === "MONITOR" && (
+                  <div>
+                    <label className="block mb-1.5 ml-0.5 text-gray-500">Link trang cần giám sát</label>
+                    <input
+                      key={selectedCampaign.id}
+                      type="url"
+                      placeholder={selectedCampaign.platform === "X" ? "Ví dụ: https://x.com/elonmusk" : "Ví dụ: https://www.threads.net/@zuck"}
+                      defaultValue={selectedCampaign.monitor_page_url || ""}
+                      onBlur={async (e) => {
+                        const newUrl = e.target.value.trim();
+                        if (newUrl === (selectedCampaign.monitor_page_url || "")) return;
+                        try {
+                          await apiFetch(`/api/campaigns/${selectedCampaign.id}`, {
+                            method: "PATCH",
+                            body: JSON.stringify({ monitor_page_url: newUrl })
+                          });
+                          showToast("Cập nhật link trang giám sát thành công!");
+                          const updated = await apiFetch(`/api/campaigns/${selectedCampaign.id}`);
+                          setSelectedCampaign(updated);
+                        } catch (err: any) {
+                          showToast(err.message, "error");
+                        }
+                      }}
+                      onKeyDown={async (e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          (e.target as HTMLInputElement).blur();
+                        }
+                      }}
+                      className="w-full h-10 bg-gray-55 border border-gray-200 rounded px-3 text-xs font-semibold text-gray-900 focus:bg-white focus:outline-none"
+                    />
+                  </div>
+                )}
+              </div>
+            ) : (
+              selectedCampaign.campaign_type === "MONITOR" && (
+                <div className="bg-white border border-gray-200 p-5 rounded-md text-xs font-bold text-gray-600 space-y-2 shadow-none">
+                  <h4 className="text-xs font-extrabold uppercase tracking-widest text-gray-500 border-b pb-2">Thông tin giám sát trang</h4>
+                  <p className="text-gray-700">Loại chiến dịch: <span className="text-gray-900 font-extrabold">Tự động (Giám sát trang)</span></p>
+                  <p className="text-gray-700">Trang giám sát: <a href={selectedCampaign.monitor_page_url} target="_blank" rel="noopener noreferrer" className="text-[#3B82F6] hover:underline font-mono">{selectedCampaign.monitor_page_url}</a></p>
+                  <p className="text-gray-700">Tần suất kiểm tra: <span className="text-gray-900 font-extrabold">{selectedCampaign.monitor_interval} phút</span></p>
+                  {selectedCampaign.last_monitored_at && (
+                    <p className="text-gray-400 text-[10px]">Lần quét gần nhất: {new Date(selectedCampaign.last_monitored_at).toLocaleString("vi-VN")}</p>
+                  )}
+                </div>
+              )
+            )}
+
             {/* Split Section: Imports */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               
@@ -486,98 +652,151 @@ export default function Campaigns() {
                   </span>
                 </div>
 
-                <div className="space-y-2">
-                    <textarea
-                      value={bulkUrls}
-                      onChange={(e) => setBulkUrls(e.target.value)}
-                      placeholder="Nhập danh sách bài viết (mỗi dòng một đường dẫn bài đăng, ví dụ: https://x.com/user/status/123)"
-                      rows={3}
-                      className="w-full bg-white border border-gray-200 rounded-md p-3.5 text-xs font-medium text-gray-900 focus:border-2 focus:border-[#3B82F6] focus:outline-none transition-all resize-none"
-                    />
-                    {bulkUrls.trim() && (
-                      <div className={`rounded-md border px-3 py-2 text-[11px] font-bold ${
-                        parsedBulkUrls.length > 0
-                          ? "bg-emerald-50 border-emerald-200 text-emerald-700"
-                          : "bg-amber-50 border-amber-200 text-amber-700"
-                      }`}>
-                        Đã nhận {parsedBulkUrls.length} URL hợp lệ cho {selectedCampaign.platform}.
-                      </div>
-                    )}
-                    <button
-                      onClick={handleImportUrls}
-                      disabled={Boolean(bulkUrls.trim()) && parsedBulkUrls.length === 0}
-                      className="w-full h-11 bg-white hover:bg-gray-50 border border-gray-200 text-[#3B82F6] font-extrabold rounded-md text-xs transition-all duration-200 hover:scale-105 cursor-pointer shadow-none disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:scale-100"
-                    >
-                      📥 Nhập danh sách bài đăng
-                    </button>
-                </div>
+                {selectedCampaign.campaign_type === "MONITOR" ? (
+                  <div className="bg-blue-50 border border-blue-200 text-blue-800 p-4 rounded-md text-xs font-bold shadow-none">
+                    <p className="flex items-center gap-1.5">📢 Chiến dịch tự động giám sát trang</p>
+                    <p className="text-gray-500 font-semibold mt-1">Các bài đăng mới phát hiện sẽ tự động được quét và đưa vào danh sách xử lý dưới đây.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                      <textarea
+                        value={bulkUrls}
+                        onChange={(e) => setBulkUrls(e.target.value)}
+                        placeholder="Nhập danh sách bài viết (mỗi dòng một đường dẫn bài đăng, ví dụ: https://x.com/user/status/123)"
+                        rows={3}
+                        className="w-full bg-white border border-gray-200 rounded-md p-3.5 text-xs font-medium text-gray-900 focus:border-2 focus:border-[#3B82F6] focus:outline-none transition-all resize-none"
+                      />
+                      {bulkUrls.trim() && (
+                        <div className={`rounded-md border px-3 py-2 text-[11px] font-bold ${
+                          parsedBulkUrls.length > 0
+                            ? "bg-emerald-50 border-emerald-200 text-emerald-700"
+                            : "bg-amber-50 border-amber-200 text-amber-700"
+                        }`}>
+                          Đã nhận {parsedBulkUrls.length} URL hợp lệ cho {selectedCampaign.platform}.
+                        </div>
+                      )}
+                      <button
+                        onClick={handleImportUrls}
+                        disabled={Boolean(bulkUrls.trim()) && parsedBulkUrls.length === 0}
+                        className="w-full h-11 bg-white hover:bg-gray-50 border border-gray-200 text-[#3B82F6] font-extrabold rounded-md text-xs transition-all duration-200 hover:scale-105 cursor-pointer shadow-none disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:scale-100"
+                      >
+                        📥 Nhập danh sách bài đăng
+                      </button>
+                  </div>
+                )}
 
-                <div className="bg-white border border-gray-200 rounded-md p-4 max-h-56 overflow-y-auto space-y-2 shadow-none">
+                <div className="bg-white border border-gray-200 rounded-md p-4 max-h-80 overflow-y-auto space-y-2 shadow-none">
                   {campaignUrls.length === 0 ? (
                     <p className="text-center text-gray-400 text-xs font-bold py-6">Chưa có bài đăng nào được nhập.</p>
                   ) : (
-                    campaignUrls.map((url) => {
-                      const job = getJobForUrl(url);
-                      const status = job?.status || url.status;
-                      const accountLabel = job?.account_username 
-                        ? `@${job.account_username}` 
-                        : (selectedCampaign.status === "DRAFT" || selectedCampaign.status === "READY")
-                        ? "Sẽ tự động gán khi chạy"
-                        : "Chưa gán tài khoản";
-
-                      return (
-                        <div key={url.id} className="p-3 bg-gray-50 rounded border border-gray-200 text-[11px] shadow-none space-y-2">
-                          <div className="flex justify-between items-start gap-3">
-                            <a
-                              href={url.url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="min-w-0 flex-1 truncate text-[#3B82F6] hover:text-blue-700 hover:underline font-mono font-extrabold"
-                              title={url.url}
-                            >
-                              {url.url}
-                            </a>
-                            <span className={`shrink-0 px-2 py-0.5 rounded text-[9px] font-extrabold uppercase ${
-                              status === "SUCCESS"
-                                ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-                                : status === "FAILED"
-                                ? "bg-red-50 text-red-700 border border-red-200"
-                                : status === "RUNNING" || status === "PROCESSING"
-                                ? "bg-blue-50 text-blue-700 border border-blue-200 animate-pulse"
-                                : status === "QUEUED" || status === "RETRYING"
-                                ? "bg-amber-50 text-amber-700 border border-amber-200"
-                                : "bg-gray-100 text-gray-600 border border-gray-200"
-                            }`}>
-                              {getJobStatusText(status)}
-                            </span>
-                          </div>
-
-                          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-gray-200 pt-2 text-[10px]">
-                            <span className="font-extrabold text-gray-700">
-                              Người xử lý: <span className="text-gray-900">{accountLabel}</span>
-                            </span>
-                            {job?.real_api && (
-                              <span className="rounded border border-emerald-200 bg-emerald-50 px-2 py-0.5 font-extrabold uppercase text-emerald-700">
-                                Cookie that
-                              </span>
-                            )}
-                            {job ? (
-                              <span className="font-bold text-gray-500">
-                                Thử {job.attempt_count}/3
-                              </span>
-                            ) : (
-                              <span className="font-bold text-gray-400">Job sẽ tạo khi chạy campaign</span>
-                            )}
-                          </div>
-
-                          {job?.error_message && (
-                            <p className="text-[10px] font-mono text-red-600 truncate" title={job.error_message}>
-                              Lỗi: {job.error_message}
-                            </p>
-                          )}
+                    <>
+                      {/* Assign All Accounts Dropdown */}
+                      {platformAccounts.length > 0 && (selectedCampaign.status === "DRAFT" || selectedCampaign.status === "READY" || selectedCampaign.status === "PAUSED") && (
+                        <div className="flex items-center gap-2 p-3 bg-blue-50 rounded border border-blue-200 mb-3">
+                          <span className="text-[11px] font-extrabold text-blue-700 whitespace-nowrap">Gán tất cả:</span>
+                          <select
+                            onChange={(e) => assignAccountToAll(e.target.value)}
+                            className="flex-1 h-8 bg-white border border-blue-200 rounded px-2 text-[11px] font-bold text-gray-900 focus:border-blue-400 focus:outline-none cursor-pointer"
+                            defaultValue=""
+                          >
+                            <option value="">— Bỏ gán tất cả —</option>
+                            {platformAccounts.map((acc) => (
+                              <option key={acc.id} value={acc.id}>
+                                @{acc.username} {acc.status !== "ACTIVE" ? `(${acc.status})` : ""}
+                              </option>
+                            ))}
+                          </select>
                         </div>
-                      );
-                    })
+                      )}
+
+                      {campaignUrls.map((url) => {
+                        const job = getJobForUrl(url);
+                        const status = job?.status || url.status;
+                        const isEditable = selectedCampaign.status === "DRAFT" || selectedCampaign.status === "READY" || selectedCampaign.status === "PAUSED";
+                        const accountLabel = job?.account_username 
+                          ? `@${job.account_username}` 
+                          : url.assigned_account_username
+                          ? `@${url.assigned_account_username}`
+                          : (selectedCampaign.status === "DRAFT" || selectedCampaign.status === "READY")
+                          ? "Tự động gán (round-robin)"
+                          : "Chưa gán tài khoản";
+
+                        return (
+                          <div key={url.id} className="p-3 bg-gray-50 rounded border border-gray-200 text-[11px] shadow-none space-y-2">
+                            <div className="flex justify-between items-start gap-3">
+                              <a
+                                href={url.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="min-w-0 flex-1 truncate text-[#3B82F6] hover:text-blue-700 hover:underline font-mono font-extrabold"
+                                title={url.url}
+                              >
+                                {url.url}
+                              </a>
+                              <span className={`shrink-0 px-2 py-0.5 rounded text-[9px] font-extrabold uppercase ${
+                                status === "SUCCESS"
+                                  ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                                  : status === "FAILED"
+                                  ? "bg-red-50 text-red-700 border border-red-200"
+                                  : status === "RUNNING" || status === "PROCESSING"
+                                  ? "bg-blue-50 text-blue-700 border border-blue-200 animate-pulse"
+                                  : status === "QUEUED" || status === "RETRYING"
+                                  ? "bg-amber-50 text-amber-700 border border-amber-200"
+                                  : "bg-gray-100 text-gray-600 border border-gray-200"
+                              }`}>
+                                {getJobStatusText(status)}
+                              </span>
+                            </div>
+
+                            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-gray-200 pt-2 text-[10px]">
+                              {isEditable && platformAccounts.length > 0 ? (
+                                <div className="flex items-center gap-1.5">
+                                  <span className="font-extrabold text-gray-700 whitespace-nowrap">Người xử lý:</span>
+                                  <select
+                                    value={url.assigned_account_id || ""}
+                                    onChange={(e) => assignAccountToUrl(url.id, e.target.value)}
+                                    className={`h-7 border rounded px-1.5 text-[10px] font-bold cursor-pointer focus:outline-none focus:border-blue-400 transition-all ${
+                                      url.assigned_account_id
+                                        ? "bg-emerald-50 border-emerald-300 text-emerald-800"
+                                        : "bg-white border-gray-200 text-gray-600"
+                                    }`}
+                                  >
+                                    <option value="">🔄 Tự động (round-robin)</option>
+                                    {platformAccounts.map((acc) => (
+                                      <option key={acc.id} value={acc.id}>
+                                        @{acc.username} {acc.status !== "ACTIVE" ? `(${acc.status})` : ""}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                              ) : (
+                                <span className="font-extrabold text-gray-700">
+                                  Người xử lý: <span className="text-gray-900">{accountLabel}</span>
+                                </span>
+                              )}
+                              {job?.real_api && (
+                                <span className="rounded border border-emerald-200 bg-emerald-50 px-2 py-0.5 font-extrabold uppercase text-emerald-700">
+                                  Cookie thật
+                                </span>
+                              )}
+                              {job ? (
+                                <span className="font-bold text-gray-500">
+                                  Thử {job.attempt_count}/3
+                                </span>
+                              ) : (
+                                <span className="font-bold text-gray-400">Job sẽ tạo khi chạy campaign</span>
+                              )}
+                            </div>
+
+                            {job?.error_message && (
+                              <p className="text-[10px] font-mono text-red-600 truncate" title={job.error_message}>
+                                Lỗi: {job.error_message}
+                              </p>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </>
                   )}
                 </div>
               </div>
@@ -695,6 +914,48 @@ export default function Campaigns() {
                   <option value="Threads">Threads</option>
                 </select>
               </div>
+
+              <div>
+                <label className="block mb-1.5 ml-0.5">Loại chiến dịch</label>
+                <select
+                  value={newCampaignType}
+                  onChange={(e) => setNewCampaignType(e.target.value)}
+                  className="w-full h-11 bg-gray-100 border border-gray-200 rounded-md px-3 text-xs font-bold text-gray-900 focus:bg-white focus:border-2 focus:border-[#3B82F6] focus:outline-none transition-all"
+                >
+                  <option value="STATIC">Thủ công (Nhập danh sách bài viết trực tiếp)</option>
+                  <option value="MONITOR">Tự động (Giám sát trang và lấy bài viết mới nhất)</option>
+                </select>
+              </div>
+
+              {newCampaignType === "MONITOR" && (
+                <>
+                  <div>
+                    <label className="block mb-1.5 ml-0.5">Link trang cần giám sát (Profile/Page Link)</label>
+                    <input
+                      type="url"
+                      value={newMonitorPageUrl}
+                      onChange={(e) => setNewMonitorPageUrl(e.target.value)}
+                      placeholder={newCampaignPlatform === "X" ? "Ví dụ: https://x.com/elonmusk" : "Ví dụ: https://www.threads.net/@zuck"}
+                      className="w-full h-11 bg-gray-100 border border-gray-200 rounded-md px-4 text-xs font-semibold text-gray-900 focus:bg-white focus:border-2 focus:border-[#3B82F6] focus:outline-none transition-all"
+                      required
+                    />
+                  </div>
+                  <div>
+                    <label className="block mb-1.5 ml-0.5">Tần suất kiểm tra</label>
+                    <select
+                      value={newMonitorInterval}
+                      onChange={(e) => setNewMonitorInterval(Number(e.target.value))}
+                      className="w-full h-11 bg-gray-100 border border-gray-200 rounded-md px-3 text-xs font-bold text-gray-900 focus:bg-white focus:border-2 focus:border-[#3B82F6] focus:outline-none transition-all"
+                    >
+                      <option value={1}>1 phút (Để test nhanh)</option>
+                      <option value={5}>5 phút</option>
+                      <option value={15}>15 phút</option>
+                      <option value={30}>30 phút</option>
+                      <option value={60}>1 giờ</option>
+                    </select>
+                  </div>
+                </>
+              )}
 
               <div>
                 <label className="block mb-1.5 ml-0.5">Mô tả chiến dịch</label>

@@ -96,11 +96,13 @@ const parseCookieMap = (value) => {
     const lines = raw.split(/\r?\n/);
     for (const line of lines) {
       let trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
+      if (!trimmed) continue;
       
       // Xóa prefix #HttpOnly_ nếu có
       if (trimmed.startsWith("#HttpOnly_")) {
         trimmed = trimmed.substring(10).trim();
+      } else if (trimmed.startsWith("#")) {
+        continue;
       }
       
       const parts = trimmed.split(/\t+/);
@@ -419,7 +421,7 @@ const usernameFromCookies = (platform, cookies, index) => {
   return `account_${index + 1}`;
 };
 
-const parseBulkAccounts = (value) => {
+const parseBulkAccountsLegacy = (value) => {
   return splitBulkAccountBlocks(value)
     .map((block, index) => {
       const platform = detectAccountPlatform(block);
@@ -462,6 +464,213 @@ const parseBulkAccounts = (value) => {
     });
 };
 
+const normalizePlatform = (value) => {
+  if (!value) return null;
+  const text = String(value).trim().toLowerCase();
+  if (["x", "twitter", "twitter/x", "x/twitter"].includes(text)) return "X";
+  if (text === "threads" || text.includes("threads")) return "Threads";
+  return null;
+};
+
+const isCookieExportArray = (value) => (
+  Array.isArray(value)
+  && value.length > 0
+  && value.every((item) => item && typeof item === "object" && "name" in item && "value" in item)
+);
+
+const cookieMapToHeader = (cookies) => Object.entries(cookies || {})
+  .filter(([name, value]) => name && value !== undefined && value !== null && String(value) !== "")
+  .map(([name, value]) => `${String(name).trim()}=${String(value).trim()}`)
+  .join("; ");
+
+const cookieInputToHeader = (value) => {
+  if (!value) return "";
+  if (typeof value === "string") {
+    const cookie = extractAccountCookie(value) || value.trim();
+    return cookieMapToHeader(parseCookieMap(cookie));
+  }
+  if (Array.isArray(value)) return cookieMapToHeader(parseCookieMap(JSON.stringify(value)));
+  if (typeof value === "object") {
+    if (Array.isArray(value.cookies)) return cookieMapToHeader(parseCookieMap(JSON.stringify(value.cookies)));
+    return cookieMapToHeader(parseCookieMap(JSON.stringify(value)));
+  }
+  return "";
+};
+
+const getRecordCookieInput = (record) => (
+  record?.cookie
+  || record?.cookies
+  || record?.cookieString
+  || record?.cookie_string
+  || record?.session_cookie
+  || record?.sessionCookie
+  || record?.rawCookie
+  || ""
+);
+
+const cleanUsernameCandidate = (value) => {
+  const cleaned = String(value || "")
+    .trim()
+    .replace(/^@/, "")
+    .replace(/[/?#].*$/, "")
+    .replace(/[^A-Za-z0-9_.]/g, "");
+  const reserved = new Set([
+    "auth_token", "ct0", "cookie", "cookies", "sessionid", "session_id",
+    "csrf_token", "csrftoken", "x", "twitter", "threads", "platform"
+  ]);
+  if (!cleaned || reserved.has(cleaned.toLowerCase())) return "";
+  return cleaned;
+};
+
+const extractUsernameFromTextBlock = (block, cookie) => {
+  const beforeCookie = cookie ? String(block).replace(cookie, " ") : String(block);
+  return cleanUsernameCandidate(extractAccountUsername(beforeCookie));
+};
+
+const buildAccountPreviewItem = ({ source, index, platform, username, displayName, cookie, errors = [] }) => {
+  let detectedPlatform = normalizePlatform(platform);
+  let parsedCookies: any = {};
+
+  try {
+    parsedCookies = parseCookieMap(cookie);
+    if (!detectedPlatform) {
+      if (parsedCookies.auth_token || parsedCookies.ct0) detectedPlatform = "X";
+      if (parsedCookies.sessionid || parsedCookies.session_id || parsedCookies.ds_user_id) detectedPlatform = "Threads";
+    }
+  } catch (err: any) {
+    errors.push(`Loi phan tich cookie: ${err.message}`);
+  }
+
+  let detectedUsername = cleanUsernameCandidate(username);
+  if (!detectedUsername && cookie) {
+    detectedUsername = usernameFromCookies(detectedPlatform || "X", parsedCookies, index);
+  }
+
+  const cookieStatus = getCookieStatus(detectedPlatform || "X", cookie);
+  const finalErrors = [...errors];
+  if (!detectedPlatform) finalErrors.push("Khong nhan dien duoc nen tang");
+  if (!detectedUsername) finalErrors.push("Khong tim thay username");
+  if (!cookie) finalErrors.push("Khong tim thay cookie");
+  if (cookie && !cookieStatus.ok) finalErrors.push(cookieStatus.details);
+
+  return {
+    line: source,
+    index,
+    platform: detectedPlatform || "X",
+    username: detectedUsername,
+    display_name: cleanUsernameCandidate(displayName) || detectedUsername,
+    cookie,
+    cookieStatus,
+    valid: finalErrors.length === 0,
+    errors: finalErrors
+  };
+};
+
+const parseJsonAccountPayload = (parsed, sourceLabel = "JSON") => {
+  const source = Array.isArray(parsed?.accounts) ? parsed.accounts : Array.isArray(parsed?.items) ? parsed.items : parsed;
+
+  if (isCookieExportArray(source)) {
+    return [{
+      source: sourceLabel,
+      platform: null,
+      username: "",
+      displayName: "",
+      cookie: cookieInputToHeader(source)
+    }];
+  }
+
+  if (Array.isArray(source)) {
+    return source.map((record, index) => ({
+      source: `${sourceLabel} #${index + 1}`,
+      platform: record?.platform || record?.type || record?.network,
+      username: record?.username || record?.handle || record?.screen_name || record?.account || record?.name,
+      displayName: record?.display_name || record?.displayName || record?.name || record?.username || record?.handle,
+      cookie: cookieInputToHeader(getRecordCookieInput(record) || record)
+    }));
+  }
+
+  if (source && typeof source === "object") {
+    return [{
+      source: sourceLabel,
+      platform: source.platform || source.type || source.network,
+      username: source.username || source.handle || source.screen_name || source.account || source.name,
+      displayName: source.display_name || source.displayName || source.name || source.username || source.handle,
+      cookie: cookieInputToHeader(getRecordCookieInput(source) || source)
+    }];
+  }
+
+  return [];
+};
+
+const parseTextAccountBlock = (block) => {
+  const trimmed = block.trim();
+  const cookie = extractAccountCookie(trimmed);
+  const platform = detectAccountPlatform(trimmed);
+  const username = extractUsernameFromTextBlock(trimmed, cookie);
+
+  if (cookie) {
+    return [{ source: trimmed, platform, username, displayName: username, cookie }];
+  }
+
+  const separator = trimmed.includes("|") ? /\s*\|\s*/ : trimmed.includes(",") ? /\s*,\s*/ : null;
+  if (!separator) return [{ source: trimmed, platform, username, displayName: username, cookie: "" }];
+
+  const parts = trimmed.split(separator).filter(Boolean);
+  const maybePlatform = parts.map(normalizePlatform).find(Boolean);
+  const cookiePart = parts.find((part) => extractAccountCookie(part));
+  const usernamePart = parts.find((part) => cleanUsernameCandidate(part) && !normalizePlatform(part) && part !== cookiePart);
+
+  return [{
+    source: trimmed,
+    platform: maybePlatform || platform,
+    username: cleanUsernameCandidate(usernamePart) || username,
+    displayName: cleanUsernameCandidate(usernamePart) || username,
+    cookie: cookiePart ? extractAccountCookie(cookiePart) : ""
+  }];
+};
+
+const parseAccountSource = (value, sourceLabel = "bulk") => {
+  const raw = String(value || "").trim();
+  if (!raw) return [];
+
+  if (raw.startsWith("[") || raw.startsWith("{")) {
+    try {
+      return parseJsonAccountPayload(JSON.parse(raw), sourceLabel);
+    } catch (err) {}
+  }
+
+  return splitBulkAccountBlocks(raw).flatMap((block, index) => {
+    const text = block.trim();
+    if (!text) return [];
+    if (text.startsWith("[") || text.startsWith("{")) {
+      try {
+        return parseJsonAccountPayload(JSON.parse(text), `${sourceLabel} #${index + 1}`);
+      } catch (err) {}
+    }
+    return parseTextAccountBlock(text);
+  });
+};
+
+const markDuplicatePreviewItems = (items) => {
+  const counts = items.reduce((acc, item) => {
+    const key = `${item.platform}:${item.username}`.toLowerCase();
+    if (item.username) acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+
+  return items.map((item) => {
+    const key = `${item.platform}:${item.username}`.toLowerCase();
+    if (!item.username || counts[key] <= 1) return item;
+    const errors = [...item.errors, "Trung username trong danh sach nhap"];
+    return { ...item, valid: false, errors };
+  });
+};
+
+const parseBulkAccounts = (value) => {
+  const rawItems = parseAccountSource(value, "bulk");
+  return markDuplicatePreviewItems(rawItems.map((item, index) => buildAccountPreviewItem({ ...item, index })));
+};
+
 export default function Accounts() {
   const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -489,15 +698,20 @@ export default function Accounts() {
 
   // Add Proxy States
   const [newProxy, setNewProxy] = useState("");
-  const [editProxy, setEditProxy] = useState("");
 
   // Edit Form Modal State
   const [showEditModal, setShowEditModal] = useState(false);
   const [editingAccount, setEditingAccount] = useState(null);
+  const [showSecrets, setShowSecrets] = useState({});
+
+  const toggleSecret = (accountId) => {
+    setShowSecrets((prev) => ({
+      ...prev,
+      [accountId]: !prev[accountId]
+    }));
+  };
   const [editDisplayName, setEditDisplayName] = useState("");
   const [editCookie, setEditCookie] = useState("");
-  const [editAccessToken, setEditAccessToken] = useState("");
-  const [editThreadsUserId, setEditThreadsUserId] = useState("");
   const [editDailyLimit, setEditDailyLimit] = useState(50);
   const [editHourlyLimit, setEditHourlyLimit] = useState(5);
   const [checkingId, setCheckingId] = useState(null);
@@ -513,7 +727,7 @@ export default function Accounts() {
 
   const [toasts, setToasts] = useState([]);
 
-  const handleMultipleFilesChange = async (e: any) => {
+  const handleMultipleFilesChangeLegacy = async (e: any) => {
     const files = Array.from((e.target as any).files || []) as any[];
     if (files.length === 0) return;
 
@@ -549,6 +763,46 @@ export default function Accounts() {
     }
 
     setFileAccounts(newAccounts);
+    e.target.value = "";
+  };
+
+  const handleMultipleFilesChange = async (e: any) => {
+    const files = Array.from((e.target as any).files || []) as any[];
+    if (files.length === 0) return;
+
+    const nextAccounts = [...fileAccounts];
+
+    for (const file of files) {
+      try {
+        const text = await file.text();
+        let previewItems = parseAccountSource(text, file.name)
+          .map((item, index) => buildAccountPreviewItem({ ...item, index }));
+
+        if (previewItems.length === 0) {
+          const parsed = parseCookieFile(file.name, text);
+          previewItems = [buildAccountPreviewItem({
+            source: file.name,
+            index: 0,
+            platform: parsed.platform,
+            username: parsed.username,
+            displayName: parsed.username,
+            cookie: parsed.cookieString
+          })];
+        }
+
+        previewItems.forEach((item, index) => {
+          nextAccounts.push({
+            ...item,
+            id: `${file.name}-${Date.now()}-${index}-${Math.random()}`,
+            fileName: previewItems.length > 1 ? `${file.name} #${index + 1}` : file.name
+          });
+        });
+      } catch (err) {
+        showToast(`Loi doc file ${file.name}: ${err.message}`, "error");
+      }
+    }
+
+    setFileAccounts(markDuplicatePreviewItems(nextAccounts));
     e.target.value = "";
   };
 
@@ -615,7 +869,7 @@ export default function Accounts() {
       loadAccounts();
     }
     if (failed.length > 0) {
-      showToast(failed.slice(0, 3).join(" | "), "error");
+      failed.forEach((err) => showToast(err, "error"));
     }
   };
 
@@ -700,7 +954,7 @@ export default function Accounts() {
   };
 
   const showToast = (message, type = "success") => {
-    const id = Date.now();
+    const id = Date.now() + Math.random();
     setToasts((prev) => [...prev, { id, message, type }]);
     setTimeout(() => {
       setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -872,36 +1126,37 @@ export default function Accounts() {
       loadAccounts();
     }
     if (failed.length > 0) {
-      showToast(failed.slice(0, 3).join(" | "), "error");
+      failed.forEach((err) => showToast(err, "error"));
     }
   };
 
-  const openEditModal = (acc) => {
-    setEditingAccount(acc);
-    setEditDisplayName(acc.display_name || "");
-    setEditCookie(acc.cookie || "");
-    setEditAccessToken(acc.access_token || "");
-    setEditThreadsUserId(acc.threads_user_id || "");
-    setEditProxy(acc.proxy || "");
-    setEditDailyLimit(acc.daily_limit || 50);
-    setEditHourlyLimit(acc.hourly_limit || 5);
-    setShowEditModal(true);
+  const openEditModal = async (acc) => {
+    try {
+      const detail = await apiFetch(`/api/accounts/${acc.id}`);
+      setEditingAccount(detail);
+      setEditDisplayName(detail.display_name || "");
+      setEditCookie(detail.cookie || "");
+      setEditDailyLimit(detail.daily_limit || 50);
+      setEditHourlyLimit(detail.hourly_limit || 5);
+      setShowEditModal(true);
+    } catch (err) {
+      showToast(err.message || "Không tải được thông tin tài khoản.", "error");
+    }
   };
 
   const handleUpdate = async (e) => {
     e.preventDefault();
     try {
+      const payload: any = {
+        display_name: editDisplayName,
+        daily_limit: Number(editDailyLimit),
+        hourly_limit: Number(editHourlyLimit)
+      };
+      if (editCookie.trim()) payload.cookie = editCookie.trim();
+
       await apiFetch(`/api/accounts/${editingAccount.id}`, {
         method: "PATCH",
-        body: JSON.stringify({
-          display_name: editDisplayName,
-          cookie: editCookie.trim() || null,
-          access_token: editAccessToken.trim() || null,
-          threads_user_id: editThreadsUserId.trim() || null,
-          proxy: editProxy.trim() || null,
-          daily_limit: Number(editDailyLimit),
-          hourly_limit: Number(editHourlyLimit)
-        })
+        body: JSON.stringify(payload)
       });
       showToast("Cập nhật thông tin tài khoản thành công!");
       setShowEditModal(false);
@@ -1080,13 +1335,13 @@ export default function Accounts() {
               {/* Badge Top-right */}
               <div className="absolute top-6 right-6 flex items-center space-x-2">
                 <span className={`px-2.5 py-0.5 rounded text-[10px] font-extrabold uppercase ${
-                  acc.access_token
+                  acc.has_access_token
                     ? "bg-purple-50 text-purple-700 border border-purple-200"
-                    : acc.cookie 
+                    : acc.has_cookie 
                     ? "bg-emerald-50 text-emerald-700 border border-emerald-200" 
                     : "bg-amber-50 text-amber-700 border border-amber-200"
                 }`}>
-                  {acc.access_token ? "🔑 Đã cài Token" : acc.cookie ? "🔑 Đã cài Cookie" : "⚠️ Chưa cấu hình"}
+                  {acc.has_access_token ? "Đã cấu hình Token" : acc.has_cookie ? "Đã cấu hình Cookie" : "Chưa cấu hình"}
                 </span>
                 <span className={`px-2.5 py-0.5 rounded text-[10px] font-extrabold uppercase ${
                   acc.platform === "X" 
@@ -1118,36 +1373,110 @@ export default function Accounts() {
                 </div>
               </div>
 
-              {acc.access_token ? (
-                <div className="mx-1 rounded-md border border-purple-200 bg-purple-50 px-3 py-2 text-[11px] font-bold text-purple-700">
-                  <div className="flex items-center justify-between gap-3">
-                    <span>✅ Graph API Token OK</span>
-                    <span className="font-mono text-[9px]">ID: {acc.threads_user_id}</span>
+              {acc.has_access_token ? (
+                acc.status === "ERROR" ? (
+                  <div className="mx-1 rounded-md border border-red-200 bg-red-50 px-3.5 py-3 text-[11px] font-bold text-red-700 space-y-2.5">
+                    <div className="flex items-center justify-between gap-3">
+                      <span>Graph API token (Lỗi/Hết hạn)</span>
+                      <button 
+                        type="button" 
+                        onClick={() => toggleSecret(acc.id)}
+                        className="text-[10px] font-extrabold uppercase bg-red-100 hover:bg-red-200 px-2 py-0.5 rounded cursor-pointer transition-all text-red-700 shrink-0"
+                      >
+                        {showSecrets[acc.id] ? "👁️ Ẩn" : "👁️ Hiện"}
+                      </button>
+                    </div>
+                    {showSecrets[acc.id] && acc.access_token && (
+                      <div className="bg-white/60 p-2 rounded font-mono text-[10px] break-all select-all font-semibold border border-red-100 text-red-700">
+                        {acc.access_token}
+                      </div>
+                    )}
+                    <div className="flex justify-between items-center gap-1.5 text-[9px] text-red-500 font-extrabold uppercase tracking-wide">
+                      <span>{acc.has_threads_user_id ? "Đã cấu hình User ID" : "Thiếu User ID"}</span>
+                    </div>
+                    <p className="mt-1 font-semibold">Vui lòng cập nhật token mới để thay thế.</p>
                   </div>
-                  <p className="mt-1 font-semibold truncate" title={acc.access_token}>Token: {acc.access_token.substring(0, 15)}...</p>
-                </div>
-              ) : acc.cookie ? (
-                <div className={`mx-1 rounded-md border px-3 py-2 text-[11px] font-bold ${
-                  getCookieStatus(acc.platform, acc.cookie).ok
-                    ? "bg-emerald-50 border-emerald-200 text-emerald-700"
-                    : "bg-amber-50 border-amber-200 text-amber-700"
-                }`}>
-                  <div className="flex items-center justify-between gap-3">
-                    <span>{getCookieStatus(acc.platform, acc.cookie).label}</span>
-                    <span>{getCookieStatus(acc.platform, acc.cookie).count} cookies</span>
+                ) : (
+                  <div className="mx-1 rounded-md border border-purple-200 bg-purple-50 px-3.5 py-3 text-[11px] font-bold text-purple-700 space-y-2.5">
+                    <div className="flex items-center justify-between gap-3">
+                      <span>Đã cấu hình Graph API Token</span>
+                      <button 
+                        type="button" 
+                        onClick={() => toggleSecret(acc.id)}
+                        className="text-[10px] font-extrabold uppercase bg-purple-100 hover:bg-purple-200 px-2 py-0.5 rounded cursor-pointer transition-all text-purple-700 shrink-0"
+                      >
+                        {showSecrets[acc.id] ? "👁️ Ẩn" : "👁️ Hiện"}
+                      </button>
+                    </div>
+                    {showSecrets[acc.id] ? (
+                      <div className="bg-white/60 p-2 rounded font-mono text-[10px] break-all select-all font-semibold border border-purple-100">
+                        {acc.access_token}
+                      </div>
+                    ) : (
+                      <p className="mt-1 font-semibold">Giá trị bí mật được ẩn để bảo mật.</p>
+                    )}
+                    <div className="flex justify-between items-center gap-1.5 text-[9px] text-purple-500 font-extrabold uppercase tracking-wide">
+                      <span>{acc.has_threads_user_id ? "Đã cấu hình User ID" : "Thiếu User ID"}</span>
+                    </div>
                   </div>
-                  <p className="mt-1 font-semibold">{getCookieStatus(acc.platform, acc.cookie).details}</p>
-                </div>
+                )
+              ) : acc.has_cookie ? (
+                acc.status === "ERROR" ? (
+                  <div className="mx-1 rounded-md border border-red-200 bg-red-50 px-3.5 py-3 text-[11px] font-bold text-red-700 space-y-2.5">
+                    <div className="flex items-center justify-between gap-3">
+                      <span>Session cookie (Lỗi/Hết hạn)</span>
+                      <button 
+                        type="button" 
+                        onClick={() => toggleSecret(acc.id)}
+                        className="text-[10px] font-extrabold uppercase bg-red-100 hover:bg-red-200 px-2 py-0.5 rounded cursor-pointer transition-all text-red-700 shrink-0"
+                      >
+                        {showSecrets[acc.id] ? "👁️ Ẩn" : "👁️ Hiện"}
+                      </button>
+                    </div>
+                    {showSecrets[acc.id] && acc.cookie && (
+                      <div className="bg-white/60 p-2 rounded font-mono text-[10px] break-all select-all font-semibold border border-red-100 text-red-700 max-h-24 overflow-y-auto">
+                        {acc.cookie}
+                      </div>
+                    )}
+                    <p className="mt-1 font-semibold">Vui lòng cập nhật cookie mới để thay thế.</p>
+                  </div>
+                ) : (
+                  <div className="mx-1 rounded-md border border-emerald-200 bg-emerald-50 px-3.5 py-3 text-[11px] font-bold text-emerald-700 space-y-2.5">
+                    <div className="flex items-center justify-between gap-3">
+                      <span>Đã cấu hình Session Cookie</span>
+                      <button 
+                        type="button" 
+                        onClick={() => toggleSecret(acc.id)}
+                        className="text-[10px] font-extrabold uppercase bg-emerald-100 hover:bg-emerald-200 px-2 py-0.5 rounded cursor-pointer transition-all text-emerald-700 shrink-0"
+                      >
+                        {showSecrets[acc.id] ? "👁️ Ẩn" : "👁️ Hiện"}
+                      </button>
+                    </div>
+                    {showSecrets[acc.id] ? (
+                      <div className="bg-white/60 p-2 rounded font-mono text-[10px] break-all select-all font-semibold border border-emerald-100 text-emerald-800 max-h-24 overflow-y-auto">
+                        {acc.cookie || "Không có nội dung cookie"}
+                      </div>
+                    ) : (
+                      <p className="mt-1 font-semibold">Chỉ cập nhật cookie khi bạn muốn thay thế.</p>
+                    )}
+                  </div>
+                )
               ) : (
-                <div className="mx-1 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] font-bold text-amber-700">
+                <div className="mx-1 rounded-md border border-amber-200 bg-amber-50 px-3.5 py-3 text-[11px] font-bold text-amber-700">
                   ⚠️ Chưa cấu hình Cookie hoặc Token.
                 </div>
               )}
 
-              {acc.proxy && (
+              {acc.has_proxy && (
                 <div className="mx-1 rounded-md border border-blue-100 bg-blue-50/50 px-3 py-1.5 text-[11px] font-bold text-blue-700 flex items-center gap-1.5">
                   <span className="shrink-0">🌐 Proxy:</span>
-                  <span className="font-mono truncate select-all" title={acc.proxy}>{acc.proxy}</span>
+                  <span className="font-mono truncate">Đã cấu hình</span>
+                </div>
+              )}
+
+              {acc.status === "ERROR" && acc.error_message && (
+                <div className="mx-1 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-[11px] font-semibold text-red-600 leading-snug">
+                  ⚠️ Lỗi: {acc.error_message}
                 </div>
               )}
 
@@ -1235,7 +1564,7 @@ export default function Accounts() {
                     </button>
                     <button
                       onClick={() => handleAutoLogin(acc.id, acc.platform, acc.username)}
-                      disabled={loginLoadingId === acc.id || !acc.cookie}
+                      disabled={loginLoadingId === acc.id || !acc.has_cookie}
                       className="flex-1 h-10 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-600 font-extrabold rounded-md transition-all duration-200 hover:scale-[1.02] flex items-center justify-center space-x-1.5 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed text-xs"
                     >
                       {loginLoadingId === acc.id ? (
@@ -1600,9 +1929,14 @@ export default function Accounts() {
                         </div>
                         
                         {item.errors.length > 0 && (
-                          <p className="text-[10px] text-red-500 font-semibold leading-tight">
-                            ⚠️ {item.errors.join(", ")}
-                          </p>
+                          <div className="text-[10px] text-red-500 font-semibold leading-tight mt-1 space-y-0.5">
+                            {item.errors.map((err, idx) => (
+                              <div key={idx} className="flex items-center gap-1">
+                                <span>⚠️</span>
+                                <span>{err}</span>
+                              </div>
+                            ))}
+                          </div>
                         )}
                       </div>
                     ))}
@@ -1749,9 +2083,14 @@ https://www.threads.net/@lifestyle_vlog sessionid=...
                             )}
                           </div>
                           {!item.valid && (
-                            <p className="text-[10px] text-red-500 font-semibold mt-1">
-                              {item.errors.join(", ")}
-                            </p>
+                            <div className="text-[10px] text-red-500 font-semibold mt-1 space-y-0.5">
+                              {item.errors.map((err, idx) => (
+                                <div key={idx} className="flex items-center gap-1 text-[9px]">
+                                  <span>⚠️</span>
+                                  <span>{err}</span>
+                                </div>
+                              ))}
+                            </div>
                           )}
                         </div>
                         <span className={`shrink-0 text-[10px] font-extrabold ${item.valid ? "text-emerald-600" : "text-red-500"}`}>
@@ -1836,43 +2175,6 @@ https://www.threads.net/@lifestyle_vlog sessionid=...
                   className="w-full bg-gray-100 border border-gray-200 rounded-md p-3 text-xs font-mono font-medium text-gray-900 focus:bg-white focus:border-2 focus:border-[#3B82F6] focus:outline-none transition-all resize-none"
                 />
                 <span className="text-[10px] text-gray-400 font-medium mt-1 block">Thay thế chuỗi session cookie lưu trữ cho tài khoản X hoặc Threads này.</span>
-              </div>
-
-              {editingAccount?.platform === "Threads" && (
-                <>
-                  <div>
-                    <label className="block mb-1.5 ml-0.5">Threads Access Token mới (Tùy chọn)</label>
-                    <textarea
-                      value={editAccessToken}
-                      onChange={(e) => setEditAccessToken(e.target.value)}
-                      placeholder="Nhập Access Token được sinh ra từ Meta for Developers..."
-                      rows={3}
-                      className="w-full bg-gray-100 border border-gray-200 rounded-md p-3 text-xs font-mono font-medium text-gray-900 focus:bg-white focus:border-2 focus:border-[#3B82F6] focus:outline-none transition-all resize-none"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block mb-1.5 ml-0.5">Threads User ID mới (Tùy chọn)</label>
-                    <input
-                      type="text"
-                      value={editThreadsUserId}
-                      onChange={(e) => setEditThreadsUserId(e.target.value)}
-                      placeholder="Ví dụ: 17841400000000000"
-                      className="w-full h-11 bg-gray-100 border border-gray-200 rounded-md px-4 text-xs font-semibold text-gray-900 focus:bg-white focus:border-2 focus:border-[#3B82F6] focus:outline-none transition-all"
-                    />
-                  </div>
-                </>
-              )}
-
-              <div>
-                <label className="block mb-1.5 ml-0.5">Proxy kết nối (Tùy chọn)</label>
-                <input
-                  type="text"
-                  value={editProxy}
-                  onChange={(e) => setEditProxy(e.target.value)}
-                  placeholder="Ví dụ: http://user:pass@ip:port hoặc http://ip:port"
-                  className="w-full h-11 bg-gray-100 border border-gray-200 rounded-md px-4 text-xs font-semibold text-gray-900 focus:bg-white focus:border-2 focus:border-[#3B82F6] focus:outline-none transition-all mb-4"
-                />
               </div>
 
               <div className="grid grid-cols-2 gap-4">
@@ -2120,32 +2422,58 @@ https://www.threads.net/@lifestyle_vlog sessionid=...
               </div>
             </div>
 
-            <div className="mt-4 flex gap-2">
-              <button
-                type="button"
-                onClick={async () => {
-                  if (!postAccountId) return;
-                  if (!postTargetUrl || !postText) { showToast('Vui lòng nhập URL và nội dung comment.', 'error'); return; }
-                  setPostingId(postAccountId);
-                  try {
-                    const res = await apiFetch(`/api/accounts/${postAccountId}/post-comment`, {
-                      method: 'POST',
-                      body: JSON.stringify({ target_url: postTargetUrl, text: postText })
-                    });
-                    showToast('✅ Comment posted: ' + (res.success ? 'OK' : 'Response received'));
-                    setShowPostModal(false);
-                    loadAccounts();
-                  } catch (err) {
-                    showToast(err.message || 'Lỗi khi gửi comment', 'error');
-                  } finally {
-                    setPostingId(null);
-                  }
-                }}
-                className="rounded-md bg-emerald-600 px-4 py-2 text-xs font-bold text-white hover:bg-emerald-700"
-              >
-                {postingId === postAccountId ? 'Đang gửi...' : 'Gửi comment'}
-              </button>
-              <button type="button" onClick={() => setShowPostModal(false)} className="rounded-md bg-gray-100 px-4 py-2 text-xs font-bold text-gray-700 hover:bg-gray-200">Hủy</button>
+            <div className="mt-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  disabled={postingId === postAccountId}
+                  onClick={async () => {
+                    if (!postAccountId) return;
+                    if (!postTargetUrl || !postText) { showToast('Vui lòng nhập URL và nội dung comment.', 'error'); return; }
+                    setPostingId(postAccountId);
+                    try {
+                      const res = await apiFetch(`/api/accounts/${postAccountId}/post-comment`, {
+                        method: 'POST',
+                        body: JSON.stringify({ target_url: postTargetUrl, text: postText })
+                      });
+                      showToast('✅ Comment posted: ' + (res.success ? 'OK' : 'Response received'));
+                      setShowPostModal(false);
+                      loadAccounts();
+                    } catch (err) {
+                      showToast(err.message || 'Lỗi khi gửi comment', 'error');
+                    } finally {
+                      setPostingId(null);
+                    }
+                  }}
+                  className={`rounded-md bg-emerald-600 px-4 py-2 text-xs font-bold text-white transition-all ${
+                    postingId === postAccountId ? 'opacity-60 cursor-not-allowed' : 'hover:bg-emerald-700'
+                  }`}
+                >
+                  {postingId === postAccountId ? (
+                    <span className="flex items-center gap-1.5">
+                      <svg className="animate-spin h-3.5 w-3.5 text-white" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                      </svg>
+                      Đang xử lý (Chrome)...
+                    </span>
+                  ) : 'Gửi comment'}
+                </button>
+                <button 
+                  type="button" 
+                  disabled={postingId === postAccountId}
+                  onClick={() => setShowPostModal(false)} 
+                  className="rounded-md bg-gray-100 px-4 py-2 text-xs font-bold text-gray-700 hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Hủy
+                </button>
+              </div>
+
+              {postingId === postAccountId && (
+                <span className="text-[11px] text-amber-600 font-bold animate-pulse">
+                  ⚡ Đang chạy trình duyệt ảo để đăng bài, vui lòng đợi 10-15 giây...
+                </span>
+              )}
             </div>
           </div>
         </div>

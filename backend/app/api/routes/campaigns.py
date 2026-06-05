@@ -2,12 +2,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from bson import ObjectId
 from datetime import datetime
 from typing import List, Optional
-import random
 
 from app.db.database import get_db
 from app.schemas import (
     CampaignCreate, CampaignUpdate, CampaignOut,
     TargetURLImport, TargetURLOut, CommentTemplateImport, CommentTemplateOut,
+    AssignAccountToURL,
     serialize_doc, serialize_docs
 )
 from app.api.routes.auth import get_current_user, write_audit_log
@@ -30,6 +30,36 @@ async def get_campaign_for_user(campaign_id: str, current_user: dict):
         raise HTTPException(status_code=404, detail="Campaign not found")
     return campaign
 
+
+async def refresh_campaign_readiness(campaign_id: ObjectId, current_status: str):
+    if current_status not in ["DRAFT", "READY"]:
+        return
+
+    db = get_db()
+    campaign = await db.campaigns.find_one({"_id": campaign_id})
+    if not campaign:
+        return
+
+    is_monitor = campaign.get("campaign_type") == "MONITOR"
+
+    has_url = True
+    if not is_monitor:
+        has_url = await db.target_urls.count_documents({
+            "campaign_id": campaign_id,
+            "status": {"$in": ["PENDING", "PROCESSING", "SUCCESS", "FAILED"]},
+        }) > 0
+
+    has_monitor_config = not is_monitor or bool(campaign.get("monitor_page_url"))
+
+    has_template = await db.comment_templates.count_documents({
+        "campaign_id": campaign_id,
+        "status": "ACTIVE",
+    }) > 0
+
+    next_status = "READY" if has_url and has_template and has_monitor_config else "DRAFT"
+    if next_status != current_status:
+        await db.campaigns.update_one({"_id": campaign_id}, {"$set": {"status": next_status}})
+
 @router.post("", response_model=CampaignOut, status_code=status.HTTP_201_CREATED)
 async def create_campaign(
     campaign_in: CampaignCreate,
@@ -43,6 +73,10 @@ async def create_campaign(
         "status": "DRAFT",
         "start_time": campaign_in.start_time,
         "end_time": campaign_in.end_time,
+        "campaign_type": campaign_in.campaign_type or "STATIC",
+        "monitor_page_url": campaign_in.monitor_page_url,
+        "monitor_interval": campaign_in.monitor_interval or 15,
+        "last_monitored_at": None,
         "created_by": current_user["username"],
         "owner_id": ObjectId(current_user["id"]),
         "created_at": datetime.utcnow()
@@ -104,16 +138,28 @@ async def update_campaign(
         update_data["start_time"] = campaign_in.start_time
     if campaign_in.end_time is not None:
         update_data["end_time"] = campaign_in.end_time
+    if campaign_in.campaign_type is not None:
+        update_data["campaign_type"] = campaign_in.campaign_type
+    if campaign_in.monitor_page_url is not None:
+        update_data["monitor_page_url"] = campaign_in.monitor_page_url
+    if campaign_in.monitor_interval is not None:
+        update_data["monitor_interval"] = campaign_in.monitor_interval
         
     if not update_data:
         return serialize_doc(campaign)
         
     await db.campaigns.update_one(
-        {"_id": ObjectId(campaign_id)},
+        {"_id": ObjectId(campaign_id), **campaign_scope(current_user)},
         {"$set": update_data}
     )
     
-    updated_campaign = await db.campaigns.find_one({"_id": ObjectId(campaign_id)})
+    updated_campaign = await db.campaigns.find_one({"_id": ObjectId(campaign_id), **campaign_scope(current_user)})
+    
+    # Auto-refresh readiness
+    await refresh_campaign_readiness(ObjectId(campaign_id), updated_campaign["status"])
+    
+    # Reload after readiness check might have changed the status
+    updated_campaign = await db.campaigns.find_one({"_id": ObjectId(campaign_id), **campaign_scope(current_user)})
     
     await write_audit_log(
         current_user["id"], current_user["username"],
@@ -132,11 +178,12 @@ async def delete_campaign(
     db = get_db()
     campaign = await get_campaign_for_user(campaign_id, current_user)
         
+    campaign_oid = ObjectId(campaign_id)
     # Delete associated data
-    await db.campaigns.delete_one({"_id": ObjectId(campaign_id)})
-    await db.target_urls.delete_many({"campaign_id": ObjectId(campaign_id)})
-    await db.comment_templates.delete_many({"campaign_id": ObjectId(campaign_id)})
-    await db.jobs.delete_many({"campaign_id": ObjectId(campaign_id)})
+    await db.campaigns.delete_one({"_id": campaign_oid, **campaign_scope(current_user)})
+    await db.target_urls.delete_many({"campaign_id": campaign_oid})
+    await db.comment_templates.delete_many({"campaign_id": campaign_oid})
+    await db.jobs.delete_many({"campaign_id": campaign_oid})
     
     await write_audit_log(
         current_user["id"], current_user["username"],
@@ -163,6 +210,10 @@ async def import_urls(
         url = url.strip()
         if not url:
             continue
+        if url.lower().startswith("https://threads.com/"):
+            url = "https://www.threads.com/" + url[len("https://threads.com/"):]
+        elif url.lower().startswith("https://threads.net/"):
+            url = "https://www.threads.net/" + url[len("https://threads.net/"):]
         # Deduplicate
         existing = await db.target_urls.find_one({"campaign_id": ObjectId(campaign_id), "url": url})
         if existing:
@@ -188,9 +239,7 @@ async def import_urls(
         new_val=f"Imported:{len(inserted_urls)}, Duplicates:{duplicates_count}"
     )
     
-    # Refresh campaign status to READY if it was DRAFT and has urls
-    if campaign["status"] == "DRAFT" and len(inserted_urls) > 0:
-        await db.campaigns.update_one({"_id": ObjectId(campaign_id)}, {"$set": {"status": "READY"}})
+    await refresh_campaign_readiness(ObjectId(campaign_id), campaign["status"])
         
     return inserted_urls
 
@@ -201,9 +250,95 @@ async def list_campaign_urls(
 ):
     db = get_db()
     await get_campaign_for_user(campaign_id, current_user)
-    cursor = db.target_urls.find({"campaign_id": ObjectId(campaign_id)}).sort("created_at", 1)
+    pipeline = [
+        {"$match": {"campaign_id": ObjectId(campaign_id)}},
+        {"$lookup": {
+            "from": "accounts",
+            "localField": "assigned_account_id",
+            "foreignField": "_id",
+            "as": "assigned_account"
+        }},
+        {"$unwind": {"path": "$assigned_account", "preserveNullAndEmptyArrays": True}},
+        {"$addFields": {
+            "assigned_account_username": "$assigned_account.username"
+        }},
+        {"$project": {"assigned_account": 0}},
+        {"$sort": {"created_at": 1}}
+    ]
+    cursor = db.target_urls.aggregate(pipeline)
     urls = await cursor.to_list(length=1000)
     return serialize_docs(urls)
+
+
+@router.put("/{campaign_id}/urls/{url_id}/assign-account")
+async def assign_account_to_url(
+    campaign_id: str,
+    url_id: str,
+    body: AssignAccountToURL,
+    current_user: dict = Depends(get_current_user)
+):
+    """Assign a specific account to a target URL. Pass account_id=null to unassign."""
+    db = get_db()
+    campaign = await get_campaign_for_user(campaign_id, current_user)
+
+    if not ObjectId.is_valid(url_id):
+        raise HTTPException(status_code=400, detail="Invalid URL ID")
+
+    url_doc = await db.target_urls.find_one({"_id": ObjectId(url_id), "campaign_id": ObjectId(campaign_id)})
+    if not url_doc:
+        raise HTTPException(status_code=404, detail="Target URL not found in this campaign")
+
+    update_data = {}
+    if body.account_id:
+        if not ObjectId.is_valid(body.account_id):
+            raise HTTPException(status_code=400, detail="Invalid account ID")
+        account = await db.accounts.find_one({
+            "_id": ObjectId(body.account_id),
+            "owner_id": ObjectId(current_user["id"]),
+            "platform": campaign["platform"]
+        })
+        if not account:
+            raise HTTPException(status_code=404, detail="Account not found or platform mismatch")
+        update_data["assigned_account_id"] = ObjectId(body.account_id)
+    else:
+        update_data["assigned_account_id"] = None
+
+    await db.target_urls.update_one({"_id": ObjectId(url_id)}, {"$set": update_data})
+
+    return {"message": "Account assignment updated successfully"}
+
+
+@router.put("/{campaign_id}/urls/assign-account-all")
+async def assign_account_to_all_urls(
+    campaign_id: str,
+    body: AssignAccountToURL,
+    current_user: dict = Depends(get_current_user)
+):
+    """Assign a specific account to ALL target URLs in a campaign. Pass account_id=null to unassign all."""
+    db = get_db()
+    campaign = await get_campaign_for_user(campaign_id, current_user)
+
+    update_data = {}
+    if body.account_id:
+        if not ObjectId.is_valid(body.account_id):
+            raise HTTPException(status_code=400, detail="Invalid account ID")
+        account = await db.accounts.find_one({
+            "_id": ObjectId(body.account_id),
+            "owner_id": ObjectId(current_user["id"]),
+            "platform": campaign["platform"]
+        })
+        if not account:
+            raise HTTPException(status_code=404, detail="Account not found or platform mismatch")
+        update_data["assigned_account_id"] = ObjectId(body.account_id)
+    else:
+        update_data["assigned_account_id"] = None
+
+    result = await db.target_urls.update_many(
+        {"campaign_id": ObjectId(campaign_id)},
+        {"$set": update_data}
+    )
+
+    return {"message": f"Account assignment updated for {result.modified_count} URLs"}
 
 # --- COMMENT TEMPLATES IMPORT & LIST ---
 @router.post("/{campaign_id}/templates", response_model=List[CommentTemplateOut])
@@ -239,6 +374,8 @@ async def import_templates(
         "IMPORT_TEMPLATES", "CAMPAIGN", campaign_id,
         new_val=f"Imported:{len(inserted_templates)}"
     )
+
+    await refresh_campaign_readiness(ObjectId(campaign_id), campaign["status"])
     
     return inserted_templates
 
@@ -253,7 +390,6 @@ async def list_campaign_templates(
     templates = await cursor.to_list(length=1000)
     return serialize_docs(templates)
 
-# --- CAMPAIGN ORCHESTRATION: START, PAUSE, STOP, DUPLICATE ---
 @router.post("/{campaign_id}/start")
 async def start_campaign(
     campaign_id: str,
@@ -262,8 +398,8 @@ async def start_campaign(
     db = get_db()
     campaign = await get_campaign_for_user(campaign_id, current_user)
         
-    if campaign["status"] in ["RUNNING", "COMPLETED"]:
-        raise HTTPException(status_code=400, detail=f"Campaign is already {campaign['status']}")
+    if campaign["status"] == "RUNNING":
+        raise HTTPException(status_code=400, detail="Campaign is already RUNNING")
         
     # Check if there are active accounts for this platform
     accounts_query = {
@@ -276,91 +412,141 @@ async def start_campaign(
     from app.services.social_mock import parse_cookie_to_dict
 
     valid_accounts = []
-    invalid_accounts = []
+    invalid_reasons = []
     for account in accounts:
         cookies = parse_cookie_to_dict(account.get("cookie"))
+        username = account.get("username", "unknown")
         if campaign["platform"] == "X":
-            valid = bool(cookies.get("auth_token") and cookies.get("ct0"))
-            required_msg = "auth_token và ct0"
+            missing = []
+            if not cookies.get("auth_token"):
+                missing.append("auth_token")
+            if not cookies.get("ct0"):
+                missing.append("ct0")
+            if not missing:
+                valid_accounts.append(account)
+            else:
+                invalid_reasons.append(f"@{username} thiếu {', '.join(missing)}")
         else:
-            valid = bool(
-                account.get("access_token") and account.get("threads_user_id")
-            ) or bool(cookies.get("sessionid") or cookies.get("session_id"))
-            required_msg = "official access_token + threads_user_id hoac sessionid/session_id"
-
-        if valid:
-            valid_accounts.append(account)
-        else:
-            invalid_accounts.append(account.get("username", "unknown"))
+            # Threads
+            has_official_token = bool(account.get("access_token") and account.get("threads_user_id"))
+            has_cookie = bool(cookies.get("sessionid") or cookies.get("session_id"))
+            if has_official_token or has_cookie:
+                valid_accounts.append(account)
+            else:
+                invalid_reasons.append(f"@{username} thiếu access_token+threads_user_id hoặc sessionid/session_id")
 
     accounts = valid_accounts
     if not accounts:
+        if invalid_reasons:
+            detail_msg = f"Không tìm thấy tài khoản {campaign['platform']} hoạt động nào có Cookie hợp lệ. Chi tiết lỗi từng tài khoản: {'; '.join(invalid_reasons)}"
+        else:
+            detail_msg = f"Không tìm thấy tài khoản {campaign['platform']} hoạt động nào được cấu hình."
         raise HTTPException(
             status_code=400,
-            detail=f"No ACTIVE {campaign['platform']} accounts with valid cookies found. Required cookie keys: {required_msg}."
+            detail=detail_msg
         )
         
+    campaign_oid = ObjectId(campaign_id)
+
     # Check if there are templates
-    templates = await db.comment_templates.find({"campaign_id": ObjectId(campaign_id)}).to_list(length=100)
+    templates = await db.comment_templates.find({"campaign_id": campaign_oid, "status": "ACTIVE"}).to_list(length=100)
     if not templates:
         raise HTTPException(
             status_code=400,
             detail="No comment templates found for this campaign. Please add templates first."
         )
+
+    # If campaign was previously COMPLETED/FAILED/STOPPED, reset everything for a fresh run
+    if campaign["status"] in ["COMPLETED", "FAILED", "STOPPED"]:
+        # Reset all non-SUCCESS URLs back to PENDING for re-processing
+        await db.target_urls.update_many(
+            {"campaign_id": campaign_oid, "status": {"$in": ["FAILED", "SKIPPED", "PROCESSING"]}},
+            {"$set": {"status": "PENDING", "error_message": None, "processed_at": None}}
+        )
+        # Delete old failed/cancelled jobs so they can be recreated
+        await db.jobs.delete_many(
+            {"campaign_id": campaign_oid, "status": {"$in": ["FAILED", "CANCELLED", "SKIPPED"]}}
+        )
+
+    is_monitor = campaign.get("campaign_type") == "MONITOR"
+
+    # Find all URLs that need processing (PENDING ones)
+    pending_urls = []
+    if not is_monitor:
+        pending_urls = await db.target_urls.find({"campaign_id": campaign_oid, "status": "PENDING"}).to_list(length=1000)
+        if not pending_urls:
+            # Check if there are paused/pending jobs to resume
+            existing_jobs = await db.jobs.find({"campaign_id": campaign_oid, "status": "PENDING"}).to_list(length=1000)
+            if not existing_jobs:
+                raise HTTPException(status_code=400, detail="No PENDING URLs or jobs found to execute. All URLs may have already been processed successfully.")
+    else:
+        pending_urls = await db.target_urls.find({"campaign_id": campaign_oid, "status": "PENDING"}).to_list(length=1000)
         
-    # Find pending URLs
-    pending_urls = await db.target_urls.find({"campaign_id": ObjectId(campaign_id), "status": "PENDING"}).to_list(length=1000)
-    if not pending_urls:
-        # If there are failed URLs, we might want to restart them, but let's assume they only run PENDING ones, or check if they have any jobs
-        existing_jobs = await db.jobs.find({"campaign_id": ObjectId(campaign_id), "status": "PENDING"}).to_list(length=1000)
-        if not existing_jobs:
-            raise HTTPException(status_code=400, detail="No PENDING URLs or jobs found to execute.")
-        
-    # Update Campaign status to RUNNING
-    await db.campaigns.update_one({"_id": ObjectId(campaign_id)}, {"$set": {"status": "RUNNING", "start_time": datetime.utcnow()}})
+    lock_result = await db.campaigns.update_one(
+        {
+            "_id": campaign_oid,
+            **campaign_scope(current_user),
+            "status": {"$ne": "RUNNING"},
+        },
+        {"$set": {"status": "RUNNING", "start_time": datetime.utcnow(), "end_time": None}},
+    )
+    if lock_result.modified_count != 1:
+        raise HTTPException(status_code=409, detail="Campaign state changed. Please refresh and try again.")
     
-    jobs_to_create = []
     jobs_to_enqueue = []
     
     # 1. Check if we have existing paused/pending jobs to resume
-    resumable_jobs = await db.jobs.find({"campaign_id": ObjectId(campaign_id), "status": "PENDING"}).to_list(length=1000)
+    resumable_jobs = await db.jobs.find({"campaign_id": campaign_oid, "status": "PENDING"}).to_list(length=1000)
     if resumable_jobs:
         for job in resumable_jobs:
             await db.jobs.update_one({"_id": job["_id"]}, {"$set": {"status": "QUEUED"}})
             await queue_service.enqueue_job(str(job["_id"]))
             jobs_to_enqueue.append(str(job["_id"]))
             
-    # 2. Otherwise generate new jobs from pending URLs
-    else:
-        for i, target_url in enumerate(pending_urls):
-            # Select account and template (round robin or random)
+    # 2. Create new jobs for pending URLs that don't have jobs yet
+    for i, target_url in enumerate(pending_urls):
+        # Check if this URL already has an active/queued job
+        existing_job = await db.jobs.find_one({
+            "campaign_id": campaign_oid,
+            "url_id": target_url["_id"],
+            "status": {"$in": ["QUEUED", "RUNNING", "PENDING", "RETRYING", "SUCCESS"]}
+        })
+        if existing_job:
+            continue
+
+        # Use assigned account if set, otherwise round-robin
+        assigned_id = target_url.get("assigned_account_id")
+        if assigned_id:
+            assigned_account = next((a for a in accounts if a["_id"] == assigned_id), None)
+            account = assigned_account if assigned_account else accounts[i % len(accounts)]
+        else:
             account = accounts[i % len(accounts)]
-            template = templates[i % len(templates)]
-            
-            job_doc = {
-                "campaign_id": ObjectId(campaign_id),
-                "account_id": account["_id"],
-                "url_id": target_url["_id"],
-                "template_id": template["_id"],
-                "status": "QUEUED",
-                "attempt_count": 0,
-                "scheduled_time": datetime.utcnow(),
-                "started_at": None,
-                "completed_at": None,
-                "error_message": None,
-                "created_at": datetime.utcnow()
-            }
-            
-            result = await db.jobs.insert_one(job_doc)
-            job_id_str = str(result.inserted_id)
-            
-            # Update target URL to PROCESSING
-            await db.target_urls.update_one({"_id": target_url["_id"]}, {"$set": {"status": "PROCESSING"}})
-            
-            # Enqueue to Redis
-            await queue_service.enqueue_job(job_id_str)
-            jobs_to_enqueue.append(job_id_str)
-            
+        template = templates[i % len(templates)]
+        
+        job_doc = {
+            "campaign_id": campaign_oid,
+            "account_id": account["_id"],
+            "url_id": target_url["_id"],
+            "template_id": template["_id"],
+            "status": "QUEUED",
+            "attempt_count": 0,
+            "scheduled_time": datetime.utcnow(),
+            "started_at": None,
+            "completed_at": None,
+            "error_message": None,
+            "created_at": datetime.utcnow()
+        }
+
+        result = await db.jobs.insert_one(job_doc)
+        job_id_str = str(result.inserted_id)
+        
+        # Update target URL to PROCESSING
+        await db.target_urls.update_one({"_id": target_url["_id"]}, {"$set": {"status": "PROCESSING"}})
+        
+        # Enqueue to Redis
+        await queue_service.enqueue_job(job_id_str)
+        jobs_to_enqueue.append(job_id_str)
+        
     await write_audit_log(
         current_user["id"], current_user["username"],
         "START", "CAMPAIGN", campaign_id,
@@ -380,11 +566,12 @@ async def pause_campaign(
     if campaign["status"] != "RUNNING":
         raise HTTPException(status_code=400, detail="Only RUNNING campaigns can be paused")
         
+    campaign_oid = ObjectId(campaign_id)
     # Set campaign status to PAUSED
-    await db.campaigns.update_one({"_id": ObjectId(campaign_id)}, {"$set": {"status": "PAUSED"}})
+    await db.campaigns.update_one({"_id": campaign_oid, **campaign_scope(current_user)}, {"$set": {"status": "PAUSED"}})
     
     # Find all QUEUED jobs and move them to PENDING, remove from Redis
-    queued_jobs = await db.jobs.find({"campaign_id": ObjectId(campaign_id), "status": "QUEUED"}).to_list(length=1000)
+    queued_jobs = await db.jobs.find({"campaign_id": campaign_oid, "status": {"$in": ["QUEUED", "RETRYING"]}}).to_list(length=1000)
     for job in queued_jobs:
         job_id = str(job["_id"])
         # Remove from Redis queue
@@ -409,14 +596,18 @@ async def stop_campaign(
 ):
     db = get_db()
     campaign = await get_campaign_for_user(campaign_id, current_user)
-        
-    # Set campaign status to COMPLETED (or stopped, but completed is standard)
-    await db.campaigns.update_one({"_id": ObjectId(campaign_id)}, {"$set": {"status": "COMPLETED", "end_time": datetime.utcnow()}})
+
+    campaign_oid = ObjectId(campaign_id)
+    stopped_at = datetime.utcnow()
+    await db.campaigns.update_one(
+        {"_id": campaign_oid, **campaign_scope(current_user)},
+        {"$set": {"status": "STOPPED", "end_time": stopped_at}},
+    )
     
     # Cancel all QUEUED or PENDING jobs
     affected_jobs = await db.jobs.find({
-        "campaign_id": ObjectId(campaign_id),
-        "status": {"$in": ["QUEUED", "PENDING", "RUNNING"]}
+        "campaign_id": campaign_oid,
+        "status": {"$in": ["QUEUED", "PENDING", "RETRYING", "RUNNING"]}
     }).to_list(length=1000)
     
     cancelled_count = 0
@@ -425,8 +616,15 @@ async def stop_campaign(
         # Remove from Redis
         await queue_service.remove_job_from_queue(job_id)
         # Update db status
-        if job["status"] in ["QUEUED", "PENDING"]:
-            await db.jobs.update_one({"_id": job["_id"]}, {"$set": {"status": "CANCELLED"}})
+        if job["status"] in ["QUEUED", "PENDING", "RETRYING", "RUNNING"]:
+            await db.jobs.update_one(
+                {"_id": job["_id"], "status": {"$in": ["QUEUED", "PENDING", "RETRYING", "RUNNING"]}},
+                {"$set": {
+                    "status": "CANCELLED",
+                    "completed_at": stopped_at,
+                    "error_message": "Campaign stopped by user"
+                }}
+            )
             await db.target_urls.update_one({"_id": job["url_id"]}, {"$set": {"status": "SKIPPED", "error_message": "Campaign stopped by user"}})
             cancelled_count += 1
             

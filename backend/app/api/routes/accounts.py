@@ -276,15 +276,18 @@ async def check_account(
         account.get("cookie"),
         access_token=account.get("access_token"),
         threads_user_id=account.get("threads_user_id"),
+        proxy=account.get("proxy"),
     )
     
     update_data = {}
     if success:
         update_data["status"] = "ACTIVE"
         update_data["health_score"] = 100
+        update_data["error_message"] = None
     else:
         update_data["status"] = "ERROR"
         update_data["health_score"] = max(20, account.get("health_score", 100) - 20)
+        update_data["error_message"] = message
         
     await db.accounts.update_one(
         {"_id": ObjectId(account_id)},

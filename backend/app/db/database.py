@@ -28,6 +28,10 @@ async def connect_to_mongo():
         # Jobs indexing for quick search
         await db_instance.db.jobs.create_index([("campaign_id", 1), ("status", 1)])
         await db_instance.db.jobs.create_index("scheduled_time")
+        try:
+            await db_instance.db.jobs.create_index([("campaign_id", 1), ("url_id", 1)], unique=True)
+        except Exception as e:
+            logger.warning(f"Could not create unique jobs(campaign_id, url_id) index: {e}")
         # Target URLs unique per campaign
         await db_instance.db.target_urls.create_index([("campaign_id", 1), ("url", 1)], unique=True)
         logger.info("Successfully connected to MongoDB and verified indexes.")

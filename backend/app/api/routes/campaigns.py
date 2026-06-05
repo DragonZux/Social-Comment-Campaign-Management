@@ -10,15 +10,30 @@ from app.schemas import (
     TargetURLImport, TargetURLOut, CommentTemplateImport, CommentTemplateOut,
     serialize_doc, serialize_docs
 )
-from app.api.routes.auth import get_current_user, require_roles, write_audit_log
+from app.api.routes.auth import get_current_user, write_audit_log
 from app.services.queue_service import queue_service
 
 router = APIRouter(prefix="/campaigns", tags=["Campaigns"])
 
+
+def campaign_scope(current_user: dict) -> dict:
+    return {"owner_id": ObjectId(current_user["id"])}
+
+
+async def get_campaign_for_user(campaign_id: str, current_user: dict):
+    if not ObjectId.is_valid(campaign_id):
+        raise HTTPException(status_code=400, detail="Invalid campaign ID")
+
+    db = get_db()
+    campaign = await db.campaigns.find_one({"_id": ObjectId(campaign_id), **campaign_scope(current_user)})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return campaign
+
 @router.post("", response_model=CampaignOut, status_code=status.HTTP_201_CREATED)
 async def create_campaign(
     campaign_in: CampaignCreate,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR"]))
+    current_user: dict = Depends(get_current_user)
 ):
     db = get_db()
     campaign_doc = {
@@ -29,6 +44,7 @@ async def create_campaign(
         "start_time": campaign_in.start_time,
         "end_time": campaign_in.end_time,
         "created_by": current_user["username"],
+        "owner_id": ObjectId(current_user["id"]),
         "created_at": datetime.utcnow()
     }
     result = await db.campaigns.insert_one(campaign_doc)
@@ -46,10 +62,11 @@ async def create_campaign(
 async def list_campaigns(
     platform: str = None,
     status: str = None,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR", "VIEWER"]))
+    current_user: dict = Depends(get_current_user)
 ):
     db = get_db()
     query = {}
+    query.update(campaign_scope(current_user))
     if platform:
         query["platform"] = platform
     if status:
@@ -62,31 +79,19 @@ async def list_campaigns(
 @router.get("/{campaign_id}", response_model=CampaignOut)
 async def get_campaign(
     campaign_id: str,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR", "VIEWER"]))
+    current_user: dict = Depends(get_current_user)
 ):
-    if not ObjectId.is_valid(campaign_id):
-        raise HTTPException(status_code=400, detail="Invalid campaign ID")
-    
-    db = get_db()
-    campaign = await db.campaigns.find_one({"_id": ObjectId(campaign_id)})
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-        
+    campaign = await get_campaign_for_user(campaign_id, current_user)
     return serialize_doc(campaign)
 
 @router.patch("/{campaign_id}", response_model=CampaignOut)
 async def update_campaign(
     campaign_id: str,
     campaign_in: CampaignUpdate,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR"]))
+    current_user: dict = Depends(get_current_user)
 ):
-    if not ObjectId.is_valid(campaign_id):
-        raise HTTPException(status_code=400, detail="Invalid campaign ID")
-        
     db = get_db()
-    campaign = await db.campaigns.find_one({"_id": ObjectId(campaign_id)})
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
+    campaign = await get_campaign_for_user(campaign_id, current_user)
         
     update_data = {}
     if campaign_in.name is not None:
@@ -122,15 +127,10 @@ async def update_campaign(
 @router.delete("/{campaign_id}")
 async def delete_campaign(
     campaign_id: str,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR"]))
+    current_user: dict = Depends(get_current_user)
 ):
-    if not ObjectId.is_valid(campaign_id):
-        raise HTTPException(status_code=400, detail="Invalid campaign ID")
-        
     db = get_db()
-    campaign = await db.campaigns.find_one({"_id": ObjectId(campaign_id)})
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
+    campaign = await get_campaign_for_user(campaign_id, current_user)
         
     # Delete associated data
     await db.campaigns.delete_one({"_id": ObjectId(campaign_id)})
@@ -151,15 +151,10 @@ async def delete_campaign(
 async def import_urls(
     campaign_id: str,
     url_import: TargetURLImport,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR"]))
+    current_user: dict = Depends(get_current_user)
 ):
-    if not ObjectId.is_valid(campaign_id):
-        raise HTTPException(status_code=400, detail="Invalid campaign ID")
-        
     db = get_db()
-    campaign = await db.campaigns.find_one({"_id": ObjectId(campaign_id)})
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
+    campaign = await get_campaign_for_user(campaign_id, current_user)
         
     inserted_urls = []
     duplicates_count = 0
@@ -202,12 +197,10 @@ async def import_urls(
 @router.get("/{campaign_id}/urls", response_model=List[TargetURLOut])
 async def list_campaign_urls(
     campaign_id: str,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR", "VIEWER"]))
+    current_user: dict = Depends(get_current_user)
 ):
-    if not ObjectId.is_valid(campaign_id):
-        raise HTTPException(status_code=400, detail="Invalid campaign ID")
-        
     db = get_db()
+    await get_campaign_for_user(campaign_id, current_user)
     cursor = db.target_urls.find({"campaign_id": ObjectId(campaign_id)}).sort("created_at", 1)
     urls = await cursor.to_list(length=1000)
     return serialize_docs(urls)
@@ -217,15 +210,10 @@ async def list_campaign_urls(
 async def import_templates(
     campaign_id: str,
     template_import: CommentTemplateImport,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR"]))
+    current_user: dict = Depends(get_current_user)
 ):
-    if not ObjectId.is_valid(campaign_id):
-        raise HTTPException(status_code=400, detail="Invalid campaign ID")
-        
     db = get_db()
-    campaign = await db.campaigns.find_one({"_id": ObjectId(campaign_id)})
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
+    campaign = await get_campaign_for_user(campaign_id, current_user)
         
     inserted_templates = []
     for content in template_import.templates:
@@ -257,12 +245,10 @@ async def import_templates(
 @router.get("/{campaign_id}/templates", response_model=List[CommentTemplateOut])
 async def list_campaign_templates(
     campaign_id: str,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR", "VIEWER"]))
+    current_user: dict = Depends(get_current_user)
 ):
-    if not ObjectId.is_valid(campaign_id):
-        raise HTTPException(status_code=400, detail="Invalid campaign ID")
-        
     db = get_db()
+    await get_campaign_for_user(campaign_id, current_user)
     cursor = db.comment_templates.find({"campaign_id": ObjectId(campaign_id)}).sort("created_at", 1)
     templates = await cursor.to_list(length=1000)
     return serialize_docs(templates)
@@ -271,25 +257,47 @@ async def list_campaign_templates(
 @router.post("/{campaign_id}/start")
 async def start_campaign(
     campaign_id: str,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR"]))
+    current_user: dict = Depends(get_current_user)
 ):
-    if not ObjectId.is_valid(campaign_id):
-        raise HTTPException(status_code=400, detail="Invalid campaign ID")
-        
     db = get_db()
-    campaign = await db.campaigns.find_one({"_id": ObjectId(campaign_id)})
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
+    campaign = await get_campaign_for_user(campaign_id, current_user)
         
     if campaign["status"] in ["RUNNING", "COMPLETED"]:
         raise HTTPException(status_code=400, detail=f"Campaign is already {campaign['status']}")
         
     # Check if there are active accounts for this platform
-    accounts = await db.accounts.find({"platform": campaign["platform"], "status": "ACTIVE"}).to_list(length=100)
+    accounts_query = {
+        "platform": campaign["platform"],
+        "status": "ACTIVE",
+        "owner_id": campaign.get("owner_id", ObjectId(current_user["id"]))
+    }
+
+    accounts = await db.accounts.find(accounts_query).to_list(length=100)
+    from app.services.social_mock import parse_cookie_to_dict
+
+    valid_accounts = []
+    invalid_accounts = []
+    for account in accounts:
+        cookies = parse_cookie_to_dict(account.get("cookie"))
+        if campaign["platform"] == "X":
+            valid = bool(cookies.get("auth_token") and cookies.get("ct0"))
+            required_msg = "auth_token và ct0"
+        else:
+            valid = bool(
+                account.get("access_token") and account.get("threads_user_id")
+            ) or bool(cookies.get("sessionid") or cookies.get("session_id"))
+            required_msg = "official access_token + threads_user_id hoac sessionid/session_id"
+
+        if valid:
+            valid_accounts.append(account)
+        else:
+            invalid_accounts.append(account.get("username", "unknown"))
+
+    accounts = valid_accounts
     if not accounts:
         raise HTTPException(
             status_code=400,
-            detail=f"No ACTIVE social accounts found for platform {campaign['platform']}. Please add/enable accounts first."
+            detail=f"No ACTIVE {campaign['platform']} accounts with valid cookies found. Required cookie keys: {required_msg}."
         )
         
     # Check if there are templates
@@ -364,15 +372,10 @@ async def start_campaign(
 @router.post("/{campaign_id}/pause")
 async def pause_campaign(
     campaign_id: str,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR"]))
+    current_user: dict = Depends(get_current_user)
 ):
-    if not ObjectId.is_valid(campaign_id):
-        raise HTTPException(status_code=400, detail="Invalid campaign ID")
-        
     db = get_db()
-    campaign = await db.campaigns.find_one({"_id": ObjectId(campaign_id)})
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
+    campaign = await get_campaign_for_user(campaign_id, current_user)
         
     if campaign["status"] != "RUNNING":
         raise HTTPException(status_code=400, detail="Only RUNNING campaigns can be paused")
@@ -402,15 +405,10 @@ async def pause_campaign(
 @router.post("/{campaign_id}/stop")
 async def stop_campaign(
     campaign_id: str,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR"]))
+    current_user: dict = Depends(get_current_user)
 ):
-    if not ObjectId.is_valid(campaign_id):
-        raise HTTPException(status_code=400, detail="Invalid campaign ID")
-        
     db = get_db()
-    campaign = await db.campaigns.find_one({"_id": ObjectId(campaign_id)})
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
+    campaign = await get_campaign_for_user(campaign_id, current_user)
         
     # Set campaign status to COMPLETED (or stopped, but completed is standard)
     await db.campaigns.update_one({"_id": ObjectId(campaign_id)}, {"$set": {"status": "COMPLETED", "end_time": datetime.utcnow()}})
@@ -443,15 +441,10 @@ async def stop_campaign(
 @router.post("/{campaign_id}/duplicate")
 async def duplicate_campaign(
     campaign_id: str,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR"]))
+    current_user: dict = Depends(get_current_user)
 ):
-    if not ObjectId.is_valid(campaign_id):
-        raise HTTPException(status_code=400, detail="Invalid campaign ID")
-        
     db = get_db()
-    campaign = await db.campaigns.find_one({"_id": ObjectId(campaign_id)})
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
+    campaign = await get_campaign_for_user(campaign_id, current_user)
         
     # Duplicate Campaign
     dup_campaign_doc = {
@@ -462,6 +455,7 @@ async def duplicate_campaign(
         "start_time": None,
         "end_time": None,
         "created_by": current_user["username"],
+        "owner_id": ObjectId(current_user["id"]),
         "created_at": datetime.utcnow()
     }
     result = await db.campaigns.insert_one(dup_campaign_doc)

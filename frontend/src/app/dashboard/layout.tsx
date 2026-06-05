@@ -8,29 +8,25 @@ export default function DashboardLayout({ children }) {
   const router = useRouter();
   const pathname = usePathname();
   const [token, setToken] = useState(null);
-  const [userRole, setUserRole] = useState("OPERATOR");
   const [username, setUsername] = useState("");
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const storedToken = localStorage.getItem("campaign_token");
-    const storedRole = localStorage.getItem("campaign_role");
-    const storedUser = localStorage.getItem("campaign_user");
+    const storedToken = sessionStorage.getItem("campaign_token");
+    const storedUser = sessionStorage.getItem("campaign_user");
 
     if (!storedToken) {
       router.replace("/login");
     } else {
       setToken(storedToken);
-      setUserRole(storedRole || "OPERATOR");
       setUsername(storedUser || "operator");
       setLoading(false);
     }
   }, [router]);
 
   const handleLogout = () => {
-    localStorage.removeItem("campaign_token");
-    localStorage.removeItem("campaign_role");
-    localStorage.removeItem("campaign_user");
+    sessionStorage.removeItem("campaign_token");
+    sessionStorage.removeItem("campaign_user");
     router.replace("/login");
   };
 
@@ -50,7 +46,6 @@ export default function DashboardLayout({ children }) {
     { id: "campaigns", label: "Quản lý chiến dịch", href: "/dashboard/campaigns", icon: "M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" },
     { id: "accounts", label: "Tài khoản mạng xã hội", href: "/dashboard/accounts", icon: "M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" },
     { id: "jobs", label: "Hàng chờ công việc", href: "/dashboard/jobs", icon: "M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 100-6 3 3 0 000 6z" },
-    { id: "audit", label: "Nhật ký bảo mật", href: "/dashboard/audit", icon: "M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" }
   ];
 
   const getHeaderTitle = () => {
@@ -59,15 +54,8 @@ export default function DashboardLayout({ children }) {
       case "/dashboard/campaigns": return "QUẢN LÝ CHIẾN DỊCH BÌNH LUẬN";
       case "/dashboard/accounts": return "QUẢN LÝ TÀI KHOẢN MẠNG XÃ HỘI";
       case "/dashboard/jobs": return "HÀNG CHỜ CÔNG VIỆC HỆ THỐNG";
-      case "/dashboard/audit": return "NHẬT KÝ BẢO MẬT & KIỂM TRA";
       default: return pathname.split("/").pop().toUpperCase();
     }
-  };
-
-  const getRoleText = (r) => {
-    if (r === "ADMIN") return "QUẢN TRỊ VIÊN";
-    if (r === "OPERATOR") return "ĐIỀU HÀNH VIÊN";
-    return "NGƯỜI XEM BÁO CÁO";
   };
 
   return (
@@ -93,7 +81,7 @@ export default function DashboardLayout({ children }) {
             <div>
               <h2 className="font-extrabold text-slate-900 text-base leading-none tracking-tight">DragonZux</h2>
               <span className="text-[9px] text-blue-600 font-extrabold uppercase tracking-wider mt-1.5 block">
-                {getRoleText(userRole)}
+                WORKSPACE RIÊNG
               </span>
             </div>
           </div>
@@ -131,7 +119,7 @@ export default function DashboardLayout({ children }) {
             <div className="truncate">
               <p className="text-slate-900 text-xs font-bold truncate">@{username}</p>
               <p className="text-[10px] text-slate-400 font-extrabold truncate uppercase tracking-wider mt-0.5">
-                {userRole === "ADMIN" ? "Quản trị viên" : userRole === "OPERATOR" ? "Điều hành viên" : "Người xem"}
+                Tài khoản hệ thống
               </p>
             </div>
           </div>

@@ -32,9 +32,6 @@ class CampaignOut(BaseModel):
     created_at: str
 
 
-class TargetURLCreate(BaseModel):
-    url: str
-
 
 class TargetURLImport(BaseModel):
     urls: List[str]
@@ -49,12 +46,6 @@ class TargetURLOut(BaseModel):
     processed_at: Optional[str] = None
     error_message: Optional[str] = None
 
-
-class CommentTemplateCreate(BaseModel):
-    content: str = Field(..., min_length=1)
-    category: Optional[str] = "General"
-    language: Optional[str] = "vi"
-    priority: Optional[str] = Field(default="MEDIUM", pattern="^(HIGH|MEDIUM|LOW)$")
 
 
 class CommentTemplateImport(BaseModel):

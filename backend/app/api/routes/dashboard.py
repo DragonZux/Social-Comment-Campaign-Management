@@ -5,23 +5,33 @@ from typing import Dict, Any, List
 
 from app.db.database import get_db
 from app.schemas import DashboardMetrics, AuditLogOut, serialize_docs
-from app.api.routes.auth import get_current_user, require_roles
+from app.api.routes.auth import get_current_user
 from app.services.queue_service import queue_service
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
+
+async def dashboard_scope(current_user: dict):
+    owner_id = ObjectId(current_user["id"])
+    db = get_db()
+    campaigns = await db.campaigns.find({"owner_id": owner_id}, {"_id": 1}).to_list(length=1000)
+    campaign_ids = [campaign["_id"] for campaign in campaigns]
+    return {"owner_id": owner_id}, {"campaign_id": {"$in": campaign_ids}}, campaign_ids
+
 @router.get("/metrics", response_model=DashboardMetrics)
 async def get_dashboard_metrics(
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR", "VIEWER"]))
+    current_user: dict = Depends(get_current_user)
 ):
     db = get_db()
+    campaign_query, job_query, campaign_ids = await dashboard_scope(current_user)
     
     # 1. Total Campaigns
-    total_campaigns = await db.campaigns.count_documents({})
+    total_campaigns = await db.campaigns.count_documents(campaign_query)
     
     # 2. Campaign Distribution by status
     campaign_distribution = {}
     cursor_dist = db.campaigns.aggregate([
+        {"$match": campaign_query},
         {"$group": {"_id": "$status", "count": {"$sum": 1}}}
     ])
     async for item in cursor_dist:
@@ -33,12 +43,13 @@ async def get_dashboard_metrics(
             campaign_distribution[status_name] = 0
             
     # 3. Active accounts count
-    active_accounts = await db.accounts.count_documents({"status": "ACTIVE"})
+    account_query = {"status": "ACTIVE", "owner_id": ObjectId(current_user["id"])}
+    active_accounts = await db.accounts.count_documents(account_query)
     
     # 4. Jobs counts
-    total_success_jobs = await db.jobs.count_documents({"status": "SUCCESS"})
-    total_failed_jobs = await db.jobs.count_documents({"status": "FAILED"})
-    total_jobs = await db.jobs.count_documents({})
+    total_success_jobs = await db.jobs.count_documents({**job_query, "status": "SUCCESS"})
+    total_failed_jobs = await db.jobs.count_documents({**job_query, "status": "FAILED"})
+    total_jobs = await db.jobs.count_documents(job_query)
     
     success_rate = 0.0
     if total_jobs > 0:
@@ -48,13 +59,13 @@ async def get_dashboard_metrics(
             success_rate = round((total_success_jobs / finished_jobs) * 100, 2)
             
     # 5. Queue Size from Redis
-    queue_size = await queue_service.get_queue_size()
+    queue_size = await db.jobs.count_documents({**job_query, "status": "QUEUED"})
     
     # 6. Average processing time
     # completed_at - started_at for SUCCESS jobs
     avg_processing_time = 0.0
     pipeline = [
-        {"$match": {"status": "SUCCESS", "started_at": {"$ne": None}, "completed_at": {"$ne": None}}},
+        {"$match": {**job_query, "status": "SUCCESS", "started_at": {"$ne": None}, "completed_at": {"$ne": None}}},
         {"$project": {
             "duration": {"$divide": [{"$subtract": ["$completed_at", "$started_at"]}, 1000]} # duration in seconds
         }},
@@ -70,6 +81,7 @@ async def get_dashboard_metrics(
         
     # 7. Recent jobs (last 10 jobs)
     recent_jobs_pipeline = [
+        {"$match": job_query},
         {"$sort": {"created_at": -1}},
         {"$limit": 10},
         {"$lookup": {
@@ -126,9 +138,10 @@ async def get_dashboard_metrics(
 
 @router.get("/audit", response_model=List[AuditLogOut])
 async def get_audit_logs(
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR", "VIEWER"]))
+    current_user: dict = Depends(get_current_user)
 ):
     db = get_db()
-    cursor = db.audit_logs.find({}).sort("created_at", -1).limit(100)
+    query = {"user_id": ObjectId(current_user["id"])}
+    cursor = db.audit_logs.find(query).sort("created_at", -1).limit(100)
     logs = await cursor.to_list(length=100)
     return serialize_docs(logs)

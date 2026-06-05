@@ -5,7 +5,6 @@ import { useState, useEffect, useRef } from "react";
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8099";
 
 export default function Jobs() {
-  const [userRole, setUserRole] = useState("OPERATOR");
   const [jobs, setJobs] = useState([]);
   const [filterStatus, setFilterStatus] = useState("");
   const [loading, setLoading] = useState(true);
@@ -21,8 +20,8 @@ export default function Jobs() {
     }, 4000);
   };
 
-  const apiFetch = async (endpoint, options = {}) => {
-    const token = localStorage.getItem("campaign_token");
+  const apiFetch = async (endpoint, options: any = {}) => {
+    const token = sessionStorage.getItem("campaign_token");
     const headers = {
       Authorization: `Bearer ${token}`,
       ...(options.headers || {})
@@ -30,12 +29,19 @@ export default function Jobs() {
     if (options.body && !headers["Content-Type"]) {
       headers["Content-Type"] = "application/json";
     }
-    const res = await fetch(`${API_BASE}${endpoint}`, { ...options, headers });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || `HTTP error ${res.status}`);
+    try {
+      const res = await fetch(`${API_BASE}${endpoint}`, { ...options, headers });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP error ${res.status}`);
+      }
+      return await res.json();
+    } catch (err: any) {
+      if (err.message === "Failed to fetch" || err.name === "TypeError") {
+        throw new Error("Không thể kết nối đến máy chủ API.");
+      }
+      throw err;
     }
-    return res.json();
   };
 
   const fetchJobs = async () => {
@@ -44,16 +50,11 @@ export default function Jobs() {
       const list = await apiFetch(endpoint);
       setJobs(list);
     } catch (err) {
-      console.error(err);
+      console.warn(err);
     } finally {
       setLoading(false);
     }
   };
-
-  useEffect(() => {
-    const role = localStorage.getItem("campaign_role");
-    setUserRole(role || "OPERATOR");
-  }, []);
 
   // Poll job data
   useEffect(() => {
@@ -99,6 +100,13 @@ export default function Jobs() {
     if (s === "QUEUED") return "Đang xếp hàng";
     if (s === "CANCELLED") return "Đã hủy";
     return s;
+  };
+
+  const getJobPlatform = (job) => {
+    if (job.platform) return job.platform;
+    const targetUrl = job.target_url || "";
+    if (targetUrl.includes("threads.net") || targetUrl.includes("threads.com")) return "Threads";
+    return "X";
   };
 
   return (
@@ -156,25 +164,28 @@ export default function Jobs() {
                 <th className="py-4 px-6">Trạng Thái</th>
                 <th className="py-4 px-6">Số Lần Thử</th>
                 <th className="py-4 px-6">Thông Tin Lỗi</th>
-                {userRole !== "VIEWER" && <th className="py-4 px-6 text-right">Thao Tác</th>}
+                <th className="py-4 px-6 text-right">Thao Tác</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-200 text-gray-900 font-semibold">
               {jobs.length === 0 ? (
                 <tr>
-                  <td colSpan="9" className="text-center py-12 text-gray-500 font-bold">Không tìm thấy tác vụ nào khớp với tiêu chí lọc.</td>
+                  <td colSpan={9} className="text-center py-12 text-gray-500 font-bold">Không tìm thấy tác vụ nào khớp với tiêu chí lọc.</td>
                 </tr>
               ) : (
-                jobs.map((job) => (
+                jobs.map((job) => {
+                  const platform = getJobPlatform(job);
+
+                  return (
                   <tr key={job.id} className="hover:bg-gray-100/50 transition-colors duration-150">
                     <td className="py-4 px-6 font-mono text-[10px] text-gray-400">{job.id.substring(18)}</td>
                     <td className="py-4 px-6">
                       <span className={`px-2.5 py-1 rounded text-[9px] font-bold uppercase ${
-                        job.target_url?.includes("threads.net") 
-                          ? "bg-purple-50 text-purple-700 border border-purple-200" 
+                        platform === "Threads"
+                          ? "bg-purple-50 text-purple-700 border border-purple-200"
                           : "bg-blue-50 text-blue-700 border border-blue-200"
                       }`}>
-                        {job.target_url?.includes("threads.net") ? "Threads" : "X"}
+                        {platform}
                       </span>
                     </td>
                     <td className="py-4 px-6 font-bold">@{job.account_username || "dynamic"}</td>
@@ -199,8 +210,7 @@ export default function Jobs() {
                     <td className="py-4 px-6 max-w-xs truncate font-mono text-red-600 text-[10px]" title={job.error_message}>
                       {job.error_message || "-"}
                     </td>
-                    {userRole !== "VIEWER" && (
-                      <td className="py-4 px-6 text-right">
+                    <td className="py-4 px-6 text-right">
                         {(job.status === "FAILED" || job.status === "CANCELLED") && (
                           <button
                             onClick={() => retryJob(job.id)}
@@ -209,10 +219,10 @@ export default function Jobs() {
                             Chạy lại
                           </button>
                         )}
-                      </td>
-                    )}
+                    </td>
                   </tr>
-                ))
+                  );
+                })
               )}
             </tbody>
           </table>

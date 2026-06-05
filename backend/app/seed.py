@@ -1,6 +1,8 @@
 import logging
 from datetime import datetime
 
+from bson import ObjectId
+
 from app.api.routes.auth import get_password_hash
 from app.db.database import get_db
 
@@ -18,18 +20,20 @@ async def seed_data():
 
     admin_hash = get_password_hash("admin123")
     operator_hash = get_password_hash("operator123")
+    admin_id = ObjectId()
+    operator_id = ObjectId()
 
     await db.users.insert_many([
         {
+            "_id": admin_id,
             "username": "admin",
             "hashed_password": admin_hash,
-            "role": "ADMIN",
             "created_at": datetime.utcnow()
         },
         {
+            "_id": operator_id,
             "username": "operator",
             "hashed_password": operator_hash,
-            "role": "OPERATOR",
             "created_at": datetime.utcnow()
         }
     ])
@@ -47,6 +51,7 @@ async def seed_data():
             "hourly_usage_count": 0,
             "last_activity": None,
             "health_score": 100,
+            "owner_id": operator_id,
             "created_at": datetime.utcnow()
         },
         {
@@ -60,6 +65,7 @@ async def seed_data():
             "hourly_usage_count": 0,
             "last_activity": None,
             "health_score": 95,
+            "owner_id": operator_id,
             "created_at": datetime.utcnow()
         },
         {
@@ -73,6 +79,7 @@ async def seed_data():
             "hourly_usage_count": 0,
             "last_activity": None,
             "health_score": 100,
+            "owner_id": operator_id,
             "created_at": datetime.utcnow()
         }
     ])

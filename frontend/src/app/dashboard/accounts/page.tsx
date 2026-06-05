@@ -96,11 +96,13 @@ const parseCookieMap = (value) => {
     const lines = raw.split(/\r?\n/);
     for (const line of lines) {
       let trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
+      if (!trimmed) continue;
       
       // Xóa prefix #HttpOnly_ nếu có
       if (trimmed.startsWith("#HttpOnly_")) {
         trimmed = trimmed.substring(10).trim();
+      } else if (trimmed.startsWith("#")) {
+        continue;
       }
       
       const parts = trimmed.split(/\t+/);
@@ -419,7 +421,7 @@ const usernameFromCookies = (platform, cookies, index) => {
   return `account_${index + 1}`;
 };
 
-const parseBulkAccounts = (value) => {
+const parseBulkAccountsLegacy = (value) => {
   return splitBulkAccountBlocks(value)
     .map((block, index) => {
       const platform = detectAccountPlatform(block);
@@ -460,6 +462,213 @@ const parseBulkAccounts = (value) => {
         errors
       };
     });
+};
+
+const normalizePlatform = (value) => {
+  if (!value) return null;
+  const text = String(value).trim().toLowerCase();
+  if (["x", "twitter", "twitter/x", "x/twitter"].includes(text)) return "X";
+  if (text === "threads" || text.includes("threads")) return "Threads";
+  return null;
+};
+
+const isCookieExportArray = (value) => (
+  Array.isArray(value)
+  && value.length > 0
+  && value.every((item) => item && typeof item === "object" && "name" in item && "value" in item)
+);
+
+const cookieMapToHeader = (cookies) => Object.entries(cookies || {})
+  .filter(([name, value]) => name && value !== undefined && value !== null && String(value) !== "")
+  .map(([name, value]) => `${String(name).trim()}=${String(value).trim()}`)
+  .join("; ");
+
+const cookieInputToHeader = (value) => {
+  if (!value) return "";
+  if (typeof value === "string") {
+    const cookie = extractAccountCookie(value) || value.trim();
+    return cookieMapToHeader(parseCookieMap(cookie));
+  }
+  if (Array.isArray(value)) return cookieMapToHeader(parseCookieMap(JSON.stringify(value)));
+  if (typeof value === "object") {
+    if (Array.isArray(value.cookies)) return cookieMapToHeader(parseCookieMap(JSON.stringify(value.cookies)));
+    return cookieMapToHeader(parseCookieMap(JSON.stringify(value)));
+  }
+  return "";
+};
+
+const getRecordCookieInput = (record) => (
+  record?.cookie
+  || record?.cookies
+  || record?.cookieString
+  || record?.cookie_string
+  || record?.session_cookie
+  || record?.sessionCookie
+  || record?.rawCookie
+  || ""
+);
+
+const cleanUsernameCandidate = (value) => {
+  const cleaned = String(value || "")
+    .trim()
+    .replace(/^@/, "")
+    .replace(/[/?#].*$/, "")
+    .replace(/[^A-Za-z0-9_.]/g, "");
+  const reserved = new Set([
+    "auth_token", "ct0", "cookie", "cookies", "sessionid", "session_id",
+    "csrf_token", "csrftoken", "x", "twitter", "threads", "platform"
+  ]);
+  if (!cleaned || reserved.has(cleaned.toLowerCase())) return "";
+  return cleaned;
+};
+
+const extractUsernameFromTextBlock = (block, cookie) => {
+  const beforeCookie = cookie ? String(block).replace(cookie, " ") : String(block);
+  return cleanUsernameCandidate(extractAccountUsername(beforeCookie));
+};
+
+const buildAccountPreviewItem = ({ source, index, platform, username, displayName, cookie, errors = [] }) => {
+  let detectedPlatform = normalizePlatform(platform);
+  let parsedCookies: any = {};
+
+  try {
+    parsedCookies = parseCookieMap(cookie);
+    if (!detectedPlatform) {
+      if (parsedCookies.auth_token || parsedCookies.ct0) detectedPlatform = "X";
+      if (parsedCookies.sessionid || parsedCookies.session_id || parsedCookies.ds_user_id) detectedPlatform = "Threads";
+    }
+  } catch (err: any) {
+    errors.push(`Loi phan tich cookie: ${err.message}`);
+  }
+
+  let detectedUsername = cleanUsernameCandidate(username);
+  if (!detectedUsername && cookie) {
+    detectedUsername = usernameFromCookies(detectedPlatform || "X", parsedCookies, index);
+  }
+
+  const cookieStatus = getCookieStatus(detectedPlatform || "X", cookie);
+  const finalErrors = [...errors];
+  if (!detectedPlatform) finalErrors.push("Khong nhan dien duoc nen tang");
+  if (!detectedUsername) finalErrors.push("Khong tim thay username");
+  if (!cookie) finalErrors.push("Khong tim thay cookie");
+  if (cookie && !cookieStatus.ok) finalErrors.push(cookieStatus.details);
+
+  return {
+    line: source,
+    index,
+    platform: detectedPlatform || "X",
+    username: detectedUsername,
+    display_name: cleanUsernameCandidate(displayName) || detectedUsername,
+    cookie,
+    cookieStatus,
+    valid: finalErrors.length === 0,
+    errors: finalErrors
+  };
+};
+
+const parseJsonAccountPayload = (parsed, sourceLabel = "JSON") => {
+  const source = Array.isArray(parsed?.accounts) ? parsed.accounts : Array.isArray(parsed?.items) ? parsed.items : parsed;
+
+  if (isCookieExportArray(source)) {
+    return [{
+      source: sourceLabel,
+      platform: null,
+      username: "",
+      displayName: "",
+      cookie: cookieInputToHeader(source)
+    }];
+  }
+
+  if (Array.isArray(source)) {
+    return source.map((record, index) => ({
+      source: `${sourceLabel} #${index + 1}`,
+      platform: record?.platform || record?.type || record?.network,
+      username: record?.username || record?.handle || record?.screen_name || record?.account || record?.name,
+      displayName: record?.display_name || record?.displayName || record?.name || record?.username || record?.handle,
+      cookie: cookieInputToHeader(getRecordCookieInput(record) || record)
+    }));
+  }
+
+  if (source && typeof source === "object") {
+    return [{
+      source: sourceLabel,
+      platform: source.platform || source.type || source.network,
+      username: source.username || source.handle || source.screen_name || source.account || source.name,
+      displayName: source.display_name || source.displayName || source.name || source.username || source.handle,
+      cookie: cookieInputToHeader(getRecordCookieInput(source) || source)
+    }];
+  }
+
+  return [];
+};
+
+const parseTextAccountBlock = (block) => {
+  const trimmed = block.trim();
+  const cookie = extractAccountCookie(trimmed);
+  const platform = detectAccountPlatform(trimmed);
+  const username = extractUsernameFromTextBlock(trimmed, cookie);
+
+  if (cookie) {
+    return [{ source: trimmed, platform, username, displayName: username, cookie }];
+  }
+
+  const separator = trimmed.includes("|") ? /\s*\|\s*/ : trimmed.includes(",") ? /\s*,\s*/ : null;
+  if (!separator) return [{ source: trimmed, platform, username, displayName: username, cookie: "" }];
+
+  const parts = trimmed.split(separator).filter(Boolean);
+  const maybePlatform = parts.map(normalizePlatform).find(Boolean);
+  const cookiePart = parts.find((part) => extractAccountCookie(part));
+  const usernamePart = parts.find((part) => cleanUsernameCandidate(part) && !normalizePlatform(part) && part !== cookiePart);
+
+  return [{
+    source: trimmed,
+    platform: maybePlatform || platform,
+    username: cleanUsernameCandidate(usernamePart) || username,
+    displayName: cleanUsernameCandidate(usernamePart) || username,
+    cookie: cookiePart ? extractAccountCookie(cookiePart) : ""
+  }];
+};
+
+const parseAccountSource = (value, sourceLabel = "bulk") => {
+  const raw = String(value || "").trim();
+  if (!raw) return [];
+
+  if (raw.startsWith("[") || raw.startsWith("{")) {
+    try {
+      return parseJsonAccountPayload(JSON.parse(raw), sourceLabel);
+    } catch (err) {}
+  }
+
+  return splitBulkAccountBlocks(raw).flatMap((block, index) => {
+    const text = block.trim();
+    if (!text) return [];
+    if (text.startsWith("[") || text.startsWith("{")) {
+      try {
+        return parseJsonAccountPayload(JSON.parse(text), `${sourceLabel} #${index + 1}`);
+      } catch (err) {}
+    }
+    return parseTextAccountBlock(text);
+  });
+};
+
+const markDuplicatePreviewItems = (items) => {
+  const counts = items.reduce((acc, item) => {
+    const key = `${item.platform}:${item.username}`.toLowerCase();
+    if (item.username) acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+
+  return items.map((item) => {
+    const key = `${item.platform}:${item.username}`.toLowerCase();
+    if (!item.username || counts[key] <= 1) return item;
+    const errors = [...item.errors, "Trung username trong danh sach nhap"];
+    return { ...item, valid: false, errors };
+  });
+};
+
+const parseBulkAccounts = (value) => {
+  const rawItems = parseAccountSource(value, "bulk");
+  return markDuplicatePreviewItems(rawItems.map((item, index) => buildAccountPreviewItem({ ...item, index })));
 };
 
 export default function Accounts() {
@@ -518,7 +727,7 @@ export default function Accounts() {
 
   const [toasts, setToasts] = useState([]);
 
-  const handleMultipleFilesChange = async (e: any) => {
+  const handleMultipleFilesChangeLegacy = async (e: any) => {
     const files = Array.from((e.target as any).files || []) as any[];
     if (files.length === 0) return;
 
@@ -554,6 +763,46 @@ export default function Accounts() {
     }
 
     setFileAccounts(newAccounts);
+    e.target.value = "";
+  };
+
+  const handleMultipleFilesChange = async (e: any) => {
+    const files = Array.from((e.target as any).files || []) as any[];
+    if (files.length === 0) return;
+
+    const nextAccounts = [...fileAccounts];
+
+    for (const file of files) {
+      try {
+        const text = await file.text();
+        let previewItems = parseAccountSource(text, file.name)
+          .map((item, index) => buildAccountPreviewItem({ ...item, index }));
+
+        if (previewItems.length === 0) {
+          const parsed = parseCookieFile(file.name, text);
+          previewItems = [buildAccountPreviewItem({
+            source: file.name,
+            index: 0,
+            platform: parsed.platform,
+            username: parsed.username,
+            displayName: parsed.username,
+            cookie: parsed.cookieString
+          })];
+        }
+
+        previewItems.forEach((item, index) => {
+          nextAccounts.push({
+            ...item,
+            id: `${file.name}-${Date.now()}-${index}-${Math.random()}`,
+            fileName: previewItems.length > 1 ? `${file.name} #${index + 1}` : file.name
+          });
+        });
+      } catch (err) {
+        showToast(`Loi doc file ${file.name}: ${err.message}`, "error");
+      }
+    }
+
+    setFileAccounts(markDuplicatePreviewItems(nextAccounts));
     e.target.value = "";
   };
 

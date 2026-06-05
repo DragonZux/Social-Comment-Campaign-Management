@@ -337,6 +337,239 @@ async def post_to_x_real(cookie_str: str, target_url: str, comment_content: str,
 
     return res_data
 
+async def post_to_x_playwright(
+    cookie_str: str,
+    target_url: str,
+    comment_content: str,
+    proxy: Optional[str] = None,
+) -> dict:
+    """Publishes an X reply through browser automation using session cookies."""
+    from playwright.async_api import async_playwright
+    import os
+    import tempfile
+
+    if not re.search(r"/status/(\d+)", target_url):
+        raise ValueError(
+            f"Could not parse Tweet ID from X URL: {target_url}. "
+            "Expected format like: https://x.com/username/status/12345"
+        )
+
+    cookies_dict = parse_cookie_to_dict(cookie_str)
+    missing = [key for key in ["auth_token", "ct0"] if not cookies_dict.get(key)]
+    if missing:
+        raise ValueError(f"Cookie X missing required keys: {', '.join(missing)}")
+
+    async def click_first_visible(locator, description: str) -> bool:
+        count = await locator.count()
+        for index in range(count):
+            candidate = locator.nth(index)
+            try:
+                if not await candidate.is_visible():
+                    continue
+                aria_disabled = await candidate.get_attribute("aria-disabled")
+                disabled = await candidate.get_attribute("disabled")
+                if aria_disabled == "true" or disabled is not None:
+                    continue
+                await candidate.click(timeout=5000)
+                logger.info(f"Clicked X {description} candidate #{index + 1}")
+                return True
+            except Exception as e:
+                logger.debug(f"Skipping X {description} candidate #{index + 1}: {e}")
+        return False
+
+    async def capture_debug(page, name: str) -> None:
+        try:
+            debug_dir = tempfile.gettempdir()
+            screenshot_path = os.path.join(debug_dir, f"x_debug_{name}.png")
+            await page.screenshot(path=screenshot_path, full_page=True)
+            logger.error(f"X debug screenshot saved to {screenshot_path}")
+            logger.error(f"X debug page title={await page.title()} url={page.url}")
+        except Exception as e:
+            logger.debug(f"Could not capture X debug screenshot: {e}")
+
+    async def capture_state(page, name: str) -> str:
+        try:
+            debug_dir = tempfile.gettempdir()
+            screenshot_path = os.path.join(debug_dir, f"x_{name}_{int(asyncio.get_event_loop().time())}.png")
+            await page.screenshot(path=screenshot_path, full_page=True)
+            logger.info(f"X screenshot saved to {screenshot_path}")
+            return screenshot_path
+        except Exception as e:
+            logger.debug(f"Could not capture X screenshot: {e}")
+            return ""
+
+    logger.info("Starting Playwright browser automation for X comment...")
+    async with async_playwright() as p:
+        launch_kwargs = {
+            "headless": True,
+            "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        }
+        if proxy:
+            launch_kwargs["proxy"] = {"server": proxy}
+
+        browser = await p.chromium.launch(**launch_kwargs)
+        try:
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+            )
+
+            playwright_cookies = []
+            for name, value in cookies_dict.items():
+                for domain in [".x.com", ".twitter.com"]:
+                    playwright_cookies.append({
+                        "name": name,
+                        "value": value,
+                        "domain": domain,
+                        "path": "/",
+                        "secure": True,
+                        "sameSite": "None",
+                    })
+            await context.add_cookies(playwright_cookies)
+
+            page = await context.new_page()
+            logger.info(f"Opening X post page: {target_url}")
+            try:
+                await page.goto(target_url, wait_until="networkidle", timeout=60000)
+            except Exception:
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+
+            await page.wait_for_timeout(3000)
+            current_url = page.url.lower()
+            if "flow/login" in current_url or "/login" in current_url:
+                await capture_debug(page, "login_redirect")
+                raise SocialAuthError("Cookie X da het han hoac khong hop le (bi chuyen ve trang dang nhap).")
+
+            login_markers = page.locator("text=/^(Log in|Sign in|Dang nhap|Login)$/i")
+            try:
+                if await login_markers.count() > 0 and await login_markers.first.is_visible():
+                    await capture_debug(page, "login_marker")
+                    raise SocialAuthError("Cookie X da het han hoac khong hop le (trang yeu cau dang nhap).")
+            except SocialAuthError:
+                raise
+            except Exception:
+                pass
+
+            article = page.locator("article").first
+            reply_button_selectors = (
+                "[data-testid='reply'], "
+                "[aria-label*='Reply'], [aria-label*='reply'], "
+                "[aria-label*='Tra loi'], [aria-label*='Trả lời'], "
+                "div[role='button']:has-text('Reply'), button:has-text('Reply')"
+            )
+
+            reply_clicked = False
+            if await article.count() > 0:
+                reply_clicked = await click_first_visible(article.locator(reply_button_selectors), "reply button in article")
+            if not reply_clicked:
+                reply_clicked = await click_first_visible(page.locator(reply_button_selectors), "reply button")
+            if not reply_clicked:
+                await capture_debug(page, "no_reply_button")
+                raise RuntimeError("Khong tim thay nut Reply tren bai X. Hay kiem tra URL bai viet hoac cookie.")
+
+            composer_selector = (
+                "[data-testid='tweetTextarea_0'], "
+                "div[role='textbox'][contenteditable='true'], "
+                "div[contenteditable='true'][aria-label*='Post'], "
+                "div[contenteditable='true'][aria-label*='Reply'], "
+                "div[contenteditable='true']"
+            )
+            try:
+                await page.wait_for_selector(composer_selector, timeout=15000)
+            except Exception:
+                await capture_debug(page, "no_composer")
+                raise SocialAuthError("Khong mo duoc khung soan reply cua X. Cookie co the het han hoac tai khoan bi checkpoint.")
+
+            dialog = page.locator("[role='dialog']").last
+            dialog_visible = await dialog.count() > 0 and await dialog.is_visible()
+            scope = dialog if dialog_visible else page
+            editor = scope.locator(composer_selector).first
+            await editor.click()
+            await page.keyboard.insert_text(comment_content)
+            await page.wait_for_timeout(1500)
+
+            submit_selectors = (
+                "[data-testid='tweetButton'], [data-testid='tweetButtonInline'], "
+                "div[role='button']:has-text('Reply'), button:has-text('Reply'), "
+                "div[role='button']:has-text('Post'), button:has-text('Post'), "
+                "[aria-label='Reply'], [aria-label='Post']"
+            )
+            submitted = await click_first_visible(scope.locator(submit_selectors), "submit reply")
+            if not submitted:
+                submitted = await click_first_visible(page.locator(submit_selectors), "submit reply page")
+            if not submitted:
+                await page.keyboard.press("Control+Enter")
+                await page.wait_for_timeout(2000)
+                try:
+                    editor_visible = await editor.is_visible()
+                    editor_text = (await editor.inner_text()).strip() if editor_visible else ""
+                    submitted = (not editor_visible) or editor_text == "" or editor_text != comment_content
+                except Exception:
+                    submitted = True
+            if not submitted:
+                await capture_debug(page, "no_submit_button")
+                raise RuntimeError("Khong tim thay nut Reply/Post kha dung tren X sau khi nhap noi dung.")
+
+            await page.wait_for_timeout(5000)
+            screenshot_path = await capture_state(page, "post_submit")
+
+            error_indicators = page.locator(
+                "[role='alert'], [role='status'], [data-testid='toast'], "
+                "text=/couldn.t|couldn't|try again|failed|restricted|limit|duplicate|already|rate|spam|khong the|thu lai|han che/i"
+            )
+            toast_messages = []
+            try:
+                for idx in range(min(await error_indicators.count(), 5)):
+                    err = error_indicators.nth(idx)
+                    if await err.is_visible():
+                        err_text = (await err.inner_text()).strip()
+                        if err_text:
+                            toast_messages.append(err_text[:180])
+                            await capture_debug(page, "submit_error")
+                            raise RuntimeError(f"X bao loi sau khi gui reply: {err_text[:180]}")
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+
+            verified = False
+            verification_msg = "Clicked submit; no visible X error was detected."
+            try:
+                editor_visible = await editor.is_visible()
+                editor_text = (await editor.inner_text()).strip() if editor_visible else ""
+                if not editor_visible:
+                    verified = True
+                    verification_msg = "Reply composer closed after submit."
+                elif editor_text == "" or editor_text != comment_content:
+                    verified = True
+                    verification_msg = "Reply composer cleared after submit."
+                elif await page.locator(f"text={comment_content}").count() > 0:
+                    verified = True
+                    verification_msg = "Reply text is visible on the page after submit."
+                else:
+                    await capture_debug(page, "not_verified")
+                    raise RuntimeError(
+                        "Da click nut Reply cua X nhung khong xac minh duoc comment da duoc gui. "
+                        "X co the da chan ngam, noi dung bi trung, hoac reply bi an/cho xu ly."
+                    )
+            except RuntimeError:
+                raise
+            except Exception as e:
+                logger.warning(f"Could not fully verify X reply after submit: {e}")
+
+            return {
+                "provider": "playwright_browser_automation_x",
+                "success": True,
+                "submitted": submitted,
+                "verified": verified,
+                "verification_msg": verification_msg,
+                "toast_messages": toast_messages,
+                "screenshot_path": screenshot_path,
+            }
+        finally:
+            await browser.close()
+
 async def post_to_threads_playwright(
     cookie_str: str,
     target_url: str,
@@ -366,6 +599,17 @@ async def post_to_threads_playwright(
             except Exception as e:
                 logger.debug(f"Skipping Threads {description} candidate #{index + 1}: {e}")
         return False
+
+    async def first_visible(locator):
+        count = await locator.count()
+        for index in range(count):
+            candidate = locator.nth(index)
+            try:
+                if await candidate.is_visible():
+                    return candidate
+            except Exception:
+                continue
+        return None
 
     async def try_submit_strategies(page, dialog_scope=None) -> bool:
         """Try multiple strategies to find and click the submit/post button."""
@@ -479,7 +723,10 @@ async def post_to_threads_playwright(
             # Extra wait for Threads SPA rendering
             await page.wait_for_timeout(3000)
 
-            editor_selector = "div[contenteditable='true'], [role='textbox'], p[contenteditable='true']"
+            editor_selector = (
+                "div[contenteditable='true'], [role='textbox'], p[contenteditable='true'], "
+                "textarea, input[placeholder*='Reply'], input[placeholder*='reply']"
+            )
             reply_trigger_selector = (
                 "[aria-label*='Reply'], [aria-label*='Trả lời'], [aria-label*='reply'], "
                 "button:has-text('Reply'), button:has-text('Trả lời'), "
@@ -544,11 +791,11 @@ async def post_to_threads_playwright(
                         "Vui lòng lấy lại cookie mới và cập nhật tài khoản."
                     )
 
-                # Wait for dialog to appear after clicking reply
+                # Threads can open a modal dialog or an inline composer under the post.
                 try:
-                    await page.wait_for_selector("[role='dialog']", timeout=10000)
+                    await page.wait_for_selector(f"[role='dialog'], {editor_selector}", timeout=10000)
                     dialog = page.locator("[role='dialog']").last
-                    dialog_visible = await dialog.is_visible()
+                    dialog_visible = await dialog.count() > 0 and await dialog.is_visible()
                 except Exception:
                     # Capture debug screenshot
                     try:
@@ -567,10 +814,13 @@ async def post_to_threads_playwright(
             # 2. Select the editor
             if dialog_visible:
                 logger.info("Reply dialog is open. Selecting editor inside the dialog.")
-                editor = dialog.locator(editor_selector).first
+                editor = await first_visible(dialog.locator(editor_selector))
             else:
-                logger.warning("No reply dialog open. Falling back to page-wide editor search.")
-                editor = page.locator(editor_selector).first
+                logger.info("Using inline Threads reply composer.")
+                editor = await first_visible(page.locator(editor_selector))
+
+            if not editor:
+                raise SocialAuthError("Khong tim thay o nhap binh luan Threads sau khi mo composer.")
 
             await editor.click()
             await page.wait_for_timeout(500)
@@ -794,8 +1044,8 @@ async def mock_post_comment(
     if has_real_cookie:
         try:
             if platform == "X":
-                result = await post_to_x_real(cookie, target_url, comment_content, proxy=proxy)
-                logger.info(f"[{platform}] Cookie-based comment posted successfully via real X API!")
+                result = await post_to_x_playwright(cookie, target_url, comment_content, proxy=proxy)
+                logger.info(f"[{platform}] Cookie-based comment posted successfully via Playwright browser automation!")
                 return {
                     "success": True,
                     "platform": platform,
@@ -902,7 +1152,6 @@ async def check_account_connection(
         cookies_dict = parse_cookie_to_dict(cookie)
         
         if platform == "X":
-            is_mock_cookie = not cookie or "mock" in cookie.lower() or len(cookie) <= 20
             csrf_token = cookies_dict.get("ct0")
             auth_token = cookies_dict.get("auth_token")
             missing = []
@@ -913,62 +1162,8 @@ async def check_account_connection(
             if missing:
                 return False, f"Cookie thiếu trường {', '.join(missing)} của X. Vui lòng cấu hình đầy đủ."
             
-            if is_mock_cookie:
-                return True, "Cookie hợp lệ (MÔ PHỎNG). Đã kết nối tài khoản X thành công."
-                
-            # Real validation check on X
-            headers = {
-                "authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnAIP4xF4ssbxNqqg4sWWWS4tDD0%3DAJu77Fr21fCD1gJJ1F7732stwSZg185s17nNw55ss",
-                "x-csrf-token": csrf_token,
-                "cookie": "; ".join([f"{k}={v}" for k, v in cookies_dict.items()]),
-                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "referer": "https://x.com/"
-            }
-            proxies = {
-                "http://": proxy,
-                "https://": proxy
-            } if proxy else None
-            
-            try:
-                async with httpx.AsyncClient(proxies=proxies, follow_redirects=True, timeout=12.0) as client:
-                    response = await client.get(
-                        "https://x.com/i/api/1.1/account/verify_credentials.json",
-                        headers=headers
-                    )
-                
-                final_url = str(response.url)
-                if "login" in final_url.lower() or "flow/login" in final_url.lower():
-                    return False, "Cookie X đã hết hạn hoặc không hợp lệ (Bị chuyển hướng về trang Đăng nhập)."
-                    
-                content_type = response.headers.get("content-type", "")
-                if "html" in content_type.lower() or response.text.strip().startswith("<"):
-                    return False, "Cookie X đã hết hạn hoặc không hợp lệ (API trả về trang HTML/Login thay vì JSON)."
-
-                if response.status_code == 200:
-                    try:
-                        res_data = response.json()
-                        screen_name = res_data.get("screen_name")
-                        if screen_name:
-                            return True, f"Đã kết nối tài khoản X thành công. Xin chào @{screen_name}!"
-                        return True, "Cookie hợp lệ. Đã kết nối tài khoản X thành công."
-                    except Exception:
-                        return True, "Cookie hợp lệ. Đã kết nối tài khoản X thành công."
-                
-                elif response.status_code in [401, 403]:
-                    err_msg = "Cookie X đã hết hạn hoặc không hợp lệ. Vui lòng lấy cookie mới."
-                    try:
-                        err_data = response.json()
-                        if "errors" in err_data:
-                            msgs = [e.get("message") for e in err_data["errors"] if e.get("message")]
-                            if msgs:
-                                err_msg = f"Lỗi từ X API: {', '.join(msgs)}"
-                    except Exception:
-                        pass
-                    return False, err_msg
-                else:
-                    return False, f"Kiểm tra thất bại. X API phản hồi HTTP {response.status_code}."
-            except Exception as e:
-                return False, f"Không thể kết nối đến X để kiểm tra cookie: {str(e)}"
+            cookie_count = len(cookies_dict)
+            return True, f"Cookie X da du auth_token va ct0. Da nhan {cookie_count} cookies."
             
         else:
             return False, f"Nền tảng {platform} chưa được hỗ trợ kiểm tra."

@@ -23,7 +23,7 @@ export default function Dashboard() {
 
   const fetchMetrics = async () => {
     try {
-      const token = localStorage.getItem("campaign_token");
+      const token = sessionStorage.getItem("campaign_token");
       if (!token) return;
 
       const res = await fetch(`${API_BASE}/api/dashboard/metrics`, {
@@ -406,7 +406,7 @@ export default function Dashboard() {
             <tbody className="divide-y divide-slate-100 text-slate-700 font-semibold">
               {filteredJobs.length === 0 ? (
                 <tr>
-                  <td colSpan="7" className="text-center py-12 text-slate-400 font-bold bg-slate-50/30">
+                  <td colSpan={7} className="text-center py-12 text-slate-400 font-bold bg-slate-50/30">
                     Không tìm thấy tác vụ nào khớp với bộ lọc.
                   </td>
                 </tr>

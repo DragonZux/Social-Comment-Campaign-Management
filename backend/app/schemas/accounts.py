@@ -8,6 +8,9 @@ class AccountCreate(BaseModel):
     username: str = Field(..., min_length=1)
     display_name: Optional[str] = None
     cookie: Optional[str] = None
+    access_token: Optional[str] = None
+    threads_user_id: Optional[str] = None
+    proxy: Optional[str] = None
     daily_limit: int = Field(default=50, ge=1)
     hourly_limit: int = Field(default=5, ge=1)
 
@@ -16,6 +19,9 @@ class AccountUpdate(BaseModel):
     display_name: Optional[str] = None
     status: Optional[str] = Field(None, pattern="^(ACTIVE|PAUSED|LIMITED|DISABLED|ERROR)$")
     cookie: Optional[str] = None
+    access_token: Optional[str] = None
+    threads_user_id: Optional[str] = None
+    proxy: Optional[str] = None
     daily_limit: Optional[int] = Field(None, ge=1)
     hourly_limit: Optional[int] = Field(None, ge=1)
     health_score: Optional[int] = Field(None, ge=0, le=100)
@@ -27,6 +33,9 @@ class AccountOut(BaseModel):
     username: str
     display_name: Optional[str] = None
     cookie: Optional[str] = None
+    access_token: Optional[str] = None
+    threads_user_id: Optional[str] = None
+    proxy: Optional[str] = None
     status: str
     daily_limit: int
     hourly_limit: int

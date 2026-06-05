@@ -5,16 +5,25 @@ from typing import List, Optional
 
 from app.db.database import get_db
 from app.schemas import JobOut, serialize_doc, serialize_docs
-from app.api.routes.auth import get_current_user, require_roles, write_audit_log
+from app.api.routes.auth import get_current_user, write_audit_log
 from app.services.queue_service import queue_service
 
 router = APIRouter(prefix="/jobs", tags=["Jobs"])
+
+
+async def allowed_campaign_ids(current_user: dict):
+    db = get_db()
+    campaigns = await db.campaigns.find(
+        {"owner_id": ObjectId(current_user["id"])},
+        {"_id": 1}
+    ).to_list(length=1000)
+    return [campaign["_id"] for campaign in campaigns]
 
 @router.get("", response_model=List[JobOut])
 async def list_jobs(
     campaign_id: Optional[str] = None,
     status: Optional[str] = None,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR", "VIEWER"]))
+    current_user: dict = Depends(get_current_user)
 ):
     db = get_db()
     match_query = {}
@@ -26,6 +35,14 @@ async def list_jobs(
         
     if status:
         match_query["status"] = status
+
+    allowed_ids = await allowed_campaign_ids(current_user)
+    if campaign_id:
+        campaign_object_id = ObjectId(campaign_id)
+        if campaign_object_id not in allowed_ids:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+    else:
+        match_query["campaign_id"] = {"$in": allowed_ids}
         
     pipeline = [
         {"$match": match_query},
@@ -56,12 +73,14 @@ async def list_jobs(
             "account_id": 1,
             "url_id": 1,
             "template_id": 1,
+            "platform": "$url.platform",
             "status": 1,
             "attempt_count": 1,
             "scheduled_time": 1,
             "started_at": 1,
             "completed_at": 1,
             "error_message": 1,
+            "real_api": 1,
             "account_username": "$account.username",
             "target_url": "$url.url",
             "template_content": "$template.content"
@@ -78,7 +97,7 @@ async def list_jobs(
 @router.get("/{job_id}", response_model=JobOut)
 async def get_job(
     job_id: str,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR", "VIEWER"]))
+    current_user: dict = Depends(get_current_user)
 ):
     if not ObjectId.is_valid(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
@@ -87,6 +106,14 @@ async def get_job(
     
     pipeline = [
         {"$match": {"_id": ObjectId(job_id)}},
+        {"$lookup": {
+            "from": "campaigns",
+            "localField": "campaign_id",
+            "foreignField": "_id",
+            "as": "campaign"
+        }},
+        {"$unwind": {"path": "$campaign", "preserveNullAndEmptyArrays": True}},
+        {"$match": {"campaign.owner_id": ObjectId(current_user["id"])}},
         {"$lookup": {
             "from": "accounts",
             "localField": "account_id",
@@ -114,12 +141,14 @@ async def get_job(
             "account_id": 1,
             "url_id": 1,
             "template_id": 1,
+            "platform": "$url.platform",
             "status": 1,
             "attempt_count": 1,
             "scheduled_time": 1,
             "started_at": 1,
             "completed_at": 1,
             "error_message": 1,
+            "real_api": 1,
             "account_username": "$account.username",
             "target_url": "$url.url",
             "template_content": "$template.content"
@@ -136,7 +165,7 @@ async def get_job(
 @router.post("/{job_id}/retry")
 async def retry_job(
     job_id: str,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR"]))
+    current_user: dict = Depends(get_current_user)
 ):
     if not ObjectId.is_valid(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
@@ -144,6 +173,13 @@ async def retry_job(
     db = get_db()
     job = await db.jobs.find_one({"_id": ObjectId(job_id)})
     if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    campaign = await db.campaigns.find_one({
+        "_id": job["campaign_id"],
+        "owner_id": ObjectId(current_user["id"])
+    })
+    if not campaign:
         raise HTTPException(status_code=404, detail="Job not found")
         
     if job["status"] not in ["FAILED", "CANCELLED"]:
@@ -177,13 +213,18 @@ async def retry_job(
 @router.post("/retry-failed-campaign/{campaign_id}")
 async def retry_all_failed_campaign_jobs(
     campaign_id: str,
-    current_user: dict = Depends(require_roles(["ADMIN", "OPERATOR"]))
+    current_user: dict = Depends(get_current_user)
 ):
     if not ObjectId.is_valid(campaign_id):
         raise HTTPException(status_code=400, detail="Invalid campaign ID")
         
     db = get_db()
-    campaign = await db.campaigns.find_one({"_id": ObjectId(campaign_id)})
+    campaign_query = {
+        "_id": ObjectId(campaign_id),
+        "owner_id": ObjectId(current_user["id"])
+    }
+
+    campaign = await db.campaigns.find_one(campaign_query)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
         

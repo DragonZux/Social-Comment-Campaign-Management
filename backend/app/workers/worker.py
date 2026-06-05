@@ -1,12 +1,19 @@
 import asyncio
 import logging
+import re
+import random
 from datetime import datetime, timedelta
 import redis.asyncio as redis
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 
 from app.core.config import settings
-from app.services.social_mock import mock_post_comment
+from app.services.social_mock import (
+    SocialAuthError,
+    SocialCheckpointError,
+    mock_post_comment,
+    parse_cookie_to_dict,
+)
 
 # Configure logging for worker
 logging.basicConfig(
@@ -14,6 +21,20 @@ logging.basicConfig(
     format="%(asctime)s - worker - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("worker")
+
+def spin_spintax(text: str) -> str:
+    """
+    Parses and spins spintax format like {hello|hi|hey} into a random choice.
+    Supports nested spintax.
+    """
+    pattern = re.compile(r'{([^{}]+)}')
+    while True:
+        match = pattern.search(text)
+        if not match:
+            break
+        options = match.group(1).split('|')
+        text = text.replace(match.group(0), random.choice(options), 1)
+    return text
 
 class Worker:
     def __init__(self):
@@ -145,6 +166,38 @@ class Worker:
                         {"$set": {"health_score": new_score, "status": status_val}}
                     )
 
+    async def handle_permanent_account_error(self, job_id_str: str, job: dict, account: dict, error_msg: str):
+        """Fail unrecoverable account/session errors without retrying the same bad cookie."""
+        db = self.db
+        now = datetime.utcnow()
+        logger.error(f"Job {job_id_str} failed with permanent account error: {error_msg}")
+
+        await db.jobs.update_one(
+            {"_id": ObjectId(job_id_str)},
+            {"$set": {
+                "status": "FAILED",
+                "completed_at": now,
+                "error_message": error_msg
+            }}
+        )
+
+        await db.target_urls.update_one(
+            {"_id": job["url_id"]},
+            {"$set": {
+                "status": "FAILED",
+                "processed_at": now,
+                "error_message": error_msg
+            }}
+        )
+
+        await db.accounts.update_one(
+            {"_id": account["_id"]},
+            {"$set": {
+                "status": "ERROR",
+                "health_score": max(0, account.get("health_score", 100) - 20)
+            }}
+        )
+
     async def check_campaign_completion(self, campaign_id):
         # Count remaining running/queued/pending jobs in this campaign
         remaining = await self.db.jobs.count_documents({
@@ -236,14 +289,39 @@ class Worker:
             await self.check_campaign_completion(campaign_id)
             return
 
+        cookies = parse_cookie_to_dict(account.get("cookie"))
+        if campaign["platform"] == "X":
+            missing = [key for key in ["auth_token", "ct0"] if not cookies.get(key)]
+        elif campaign["platform"] == "Threads":
+            has_official_token = bool(account.get("access_token") and account.get("threads_user_id"))
+            has_cookie = bool(cookies.get("sessionid") or cookies.get("session_id"))
+            missing = [] if has_official_token or has_cookie else ["official access_token + threads_user_id or sessionid/session_id"]
+        else:
+            missing = [f"unsupported platform {campaign['platform']}"]
+
+        if missing:
+            await self.handle_retry(
+                job_id_str,
+                job,
+                f"Account @{account['username']} is missing required cookie keys: {', '.join(missing)}"
+            )
+            await self.check_campaign_completion(campaign_id)
+            return
+
         try:
-            # Execute mock API call
+            # Spin the comment text if it contains spintax (e.g. {Hello|Hi} world!)
+            comment_text = spin_spintax(template_doc["content"])
+
+            # Execute real cookie-based API call
             result = await mock_post_comment(
                 platform=campaign["platform"],
                 username=account["username"],
                 target_url=url_doc["url"],
-                comment_content=template_doc["content"],
-                cookie=account.get("cookie")
+                comment_content=comment_text,
+                cookie=account.get("cookie"),
+                proxy=account.get("proxy"),
+                access_token=account.get("access_token"),
+                threads_user_id=account.get("threads_user_id"),
             )
             
             # Success!
@@ -253,7 +331,8 @@ class Worker:
                 {"$set": {
                     "status": "SUCCESS",
                     "completed_at": now,
-                    "error_message": None
+                    "error_message": None,
+                    "real_api": result.get("real_api", False)
                 }}
             )
             
@@ -277,8 +356,10 @@ class Worker:
             )
             logger.info(f"Job {job_id_str} processed successfully!")
             
+        except (SocialAuthError, SocialCheckpointError) as e:
+            await self.handle_permanent_account_error(job_id_str, job, account, str(e))
         except Exception as e:
-            # Handle mock service errors
+            # Handle transient service errors with retry/backoff.
             await self.handle_retry(job_id_str, job, str(e))
             
         # Check if campaign has finished

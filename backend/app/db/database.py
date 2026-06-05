@@ -19,8 +19,12 @@ async def connect_to_mongo():
     try:
         # User collection unique index
         await db_instance.db.users.create_index("username", unique=True)
-        # Account collection unique index per platform
-        await db_instance.db.accounts.create_index([("platform", 1), ("username", 1)], unique=True)
+        # Account usernames are unique inside each user's private workspace.
+        try:
+            await db_instance.db.accounts.drop_index("platform_1_username_1")
+        except Exception:
+            pass
+        await db_instance.db.accounts.create_index([("owner_id", 1), ("platform", 1), ("username", 1)], unique=True)
         # Jobs indexing for quick search
         await db_instance.db.jobs.create_index([("campaign_id", 1), ("status", 1)])
         await db_instance.db.jobs.create_index("scheduled_time")

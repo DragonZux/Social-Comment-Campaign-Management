@@ -10,12 +10,11 @@ export default function Login() {
   const [isRegistering, setIsRegistering] = useState(false);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [role, setRole] = useState("OPERATOR");
   const [error, setError] = useState("");
   const [toasts, setToasts] = useState([]);
 
   useEffect(() => {
-    const token = localStorage.getItem("campaign_token");
+    const token = sessionStorage.getItem("campaign_token");
     if (token) {
       router.replace("/dashboard");
     }
@@ -37,7 +36,7 @@ export default function Login() {
         const res = await fetch(`${API_BASE}/api/auth/register`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username, password, role })
+          body: JSON.stringify({ username, password })
         });
 
         if (!res.ok) {
@@ -46,9 +45,8 @@ export default function Login() {
         }
 
         const data = await res.json();
-        localStorage.setItem("campaign_token", data.access_token);
-        localStorage.setItem("campaign_role", data.role);
-        localStorage.setItem("campaign_user", data.username);
+        sessionStorage.setItem("campaign_token", data.access_token);
+        sessionStorage.setItem("campaign_user", data.username);
         showToast("Đăng ký tài khoản thành công!");
         router.push("/dashboard");
       } else {
@@ -67,9 +65,8 @@ export default function Login() {
         }
 
         const data = await res.json();
-        localStorage.setItem("campaign_token", data.access_token);
-        localStorage.setItem("campaign_role", data.role);
-        localStorage.setItem("campaign_user", data.username);
+        sessionStorage.setItem("campaign_token", data.access_token);
+        sessionStorage.setItem("campaign_user", data.username);
         showToast("Đăng nhập thành công!");
         router.push("/dashboard");
       }
@@ -140,21 +137,6 @@ export default function Login() {
             />
           </div>
 
-          {isRegistering && (
-            <div>
-              <label className="block text-gray-600 text-xs font-bold uppercase tracking-wider mb-2">Vai trò tài khoản</label>
-              <select
-                value={role}
-                onChange={(e) => setRole(e.target.value)}
-                className="w-full h-12 bg-gray-100 px-4 text-sm font-bold text-gray-600 border-2 border-transparent rounded-md focus:bg-white focus:border-[#3B82F6] focus:outline-none transition-all duration-200"
-              >
-                <option value="OPERATOR">ĐIỀU HÀNH (Tạo & chạy chiến dịch)</option>
-                <option value="ADMIN">QUẢN TRỊ (Quản lý toàn bộ hệ thống)</option>
-                <option value="VIEWER">NGƯỜI XEM (Chỉ xem báo cáo)</option>
-              </select>
-            </div>
-          )}
-
           {error && (
             <div className="bg-red-50 border border-red-200 text-red-600 text-xs font-bold rounded-md p-3 text-center">
               {error}
@@ -192,7 +174,7 @@ export default function Login() {
               }}
               className="h-10 bg-white hover:bg-gray-50 border-2 border-gray-200 rounded-md px-4 text-xs font-bold text-gray-700 transition-all duration-150 cursor-pointer"
             >
-              Quản trị (Admin)
+              Admin
             </button>
             <button
               onClick={() => {
@@ -202,7 +184,7 @@ export default function Login() {
               }}
               className="h-10 bg-white hover:bg-gray-50 border-2 border-gray-200 rounded-md px-4 text-xs font-bold text-gray-700 transition-all duration-150 cursor-pointer"
             >
-              Điều hành (Operator)
+              Operator
             </button>
           </div>
         </div>

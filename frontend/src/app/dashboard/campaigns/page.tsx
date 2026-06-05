@@ -4,12 +4,72 @@ import { useState, useEffect, useRef } from "react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8099";
 
+const collectStrings = (value) => {
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(collectStrings);
+  if (value && typeof value === "object") return Object.values(value).flatMap(collectStrings);
+  return [];
+};
+
+const uniqueList = (items) => Array.from(new Set(items));
+
+const extractUrlsFromText = (value, platform) => {
+  const raw = value.trim();
+  if (!raw) return [];
+
+  let source = raw;
+  try {
+    source = collectStrings(JSON.parse(raw)).join("\n");
+  } catch (err) {
+    source = raw;
+  }
+
+  // Support matching both threads.net and threads.com domains
+  const urlMatches = source.match(/(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|threads\.net|threads\.com)\/[^\s"'<>]+/gi) || [];
+  const normalized = urlMatches
+    .map((url) => url.replace(/[),.;\]]+$/, ""))
+    .map((url) => (url.startsWith("http") ? url : `https://${url}`))
+    // Automatically normalize threads.com to threads.net domain
+    .map((url) => url.replace(/threads\.com/i, "threads.net"))
+    .filter((url) => {
+      if (platform === "X") return /https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\//i.test(url);
+      if (platform === "Threads") return /https?:\/\/(?:www\.)?threads\.net\//i.test(url);
+      return true;
+    });
+
+  return uniqueList(normalized);
+};
+
+const parseCommentTemplates = (value) => {
+  const raw = value.trim();
+  if (!raw) return [];
+
+  try {
+    const parsed = JSON.parse(raw);
+    const strings = Array.isArray(parsed)
+      ? parsed.map((item) => {
+          if (typeof item === "string") return item;
+          if (item && typeof item === "object") return item.content || item.comment || item.text || item.message || "";
+          return "";
+        })
+      : collectStrings(parsed);
+
+    return uniqueList(strings.map((item) => item.trim()).filter(Boolean));
+  } catch (err) {
+    const blocks = raw.includes("\n\n")
+      ? raw.split(/\r?\n\s*\r?\n/)
+      : raw.split(/\r?\n/);
+
+    return uniqueList(blocks.map((item) => item.trim()).filter(Boolean));
+  }
+};
+
 export default function Campaigns() {
-  const [userRole, setUserRole] = useState("OPERATOR");
   const [campaigns, setCampaigns] = useState([]);
   const [selectedCampaign, setSelectedCampaign] = useState(null);
   const [campaignUrls, setCampaignUrls] = useState([]);
   const [campaignTemplates, setCampaignTemplates] = useState([]);
+  const [campaignJobs, setCampaignJobs] = useState([]);
   
   // Form and Modal States
   const [newCampaignName, setNewCampaignName] = useState("");
@@ -21,6 +81,8 @@ export default function Campaigns() {
 
   const [toasts, setToasts] = useState([]);
   const timerRef = useRef(null);
+  const parsedBulkUrls = extractUrlsFromText(bulkUrls, selectedCampaign?.platform);
+  const parsedBulkTemplates = parseCommentTemplates(bulkTemplates);
 
   const showToast = (message, type = "success") => {
     const id = Date.now();
@@ -30,8 +92,8 @@ export default function Campaigns() {
     }, 4000);
   };
 
-  const apiFetch = async (endpoint, options = {}) => {
-    const token = localStorage.getItem("campaign_token");
+  const apiFetch = async (endpoint, options: any = {}) => {
+    const token = sessionStorage.getItem("campaign_token");
     const headers = {
       Authorization: `Bearer ${token}`,
       ...(options.headers || {})
@@ -39,12 +101,19 @@ export default function Campaigns() {
     if (options.body && !headers["Content-Type"]) {
       headers["Content-Type"] = "application/json";
     }
-    const res = await fetch(`${API_BASE}${endpoint}`, { ...options, headers });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || `HTTP error ${res.status}`);
+    try {
+      const res = await fetch(`${API_BASE}${endpoint}`, { ...options, headers });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP error ${res.status}`);
+      }
+      return await res.json();
+    } catch (err: any) {
+      if (err.message === "Failed to fetch" || err.name === "TypeError") {
+        throw new Error("Không thể kết nối đến máy chủ API.");
+      }
+      throw err;
     }
-    return res.json();
   };
 
   const loadCampaigns = async () => {
@@ -52,7 +121,7 @@ export default function Campaigns() {
       const list = await apiFetch("/api/campaigns");
       setCampaigns(list);
     } catch (err) {
-      console.error(err);
+      console.warn(err);
     }
   };
 
@@ -64,14 +133,14 @@ export default function Campaigns() {
       setCampaignUrls(urls);
       const tpls = await apiFetch(`/api/campaigns/${campaign.id}/templates`);
       setCampaignTemplates(tpls);
+      const jobs = await apiFetch(`/api/jobs?campaign_id=${campaign.id}`);
+      setCampaignJobs(jobs);
     } catch (err) {
-      console.error(err);
+      console.warn(err);
     }
   };
 
   useEffect(() => {
-    const role = localStorage.getItem("campaign_role");
-    setUserRole(role || "OPERATOR");
     loadCampaigns();
   }, []);
 
@@ -87,8 +156,10 @@ export default function Campaigns() {
         setCampaignUrls(urls);
         const tpls = await apiFetch(`/api/campaigns/${selectedCampaign.id}/templates`);
         setCampaignTemplates(tpls);
+        const jobs = await apiFetch(`/api/jobs?campaign_id=${selectedCampaign.id}`);
+        setCampaignJobs(jobs);
       } catch (err) {
-        console.error("Poll details error:", err);
+        console.warn("Poll details error:", err);
       }
     };
 
@@ -123,7 +194,11 @@ export default function Campaigns() {
   const handleImportUrls = async () => {
     if (!bulkUrls.trim()) return;
     try {
-      const urlsArray = bulkUrls.split("\n").map(u => u.trim()).filter(Boolean);
+      const urlsArray = extractUrlsFromText(bulkUrls, selectedCampaign?.platform);
+      if (urlsArray.length === 0) {
+        showToast("Không tìm thấy URL hợp lệ cho nền tảng chiến dịch này.", "error");
+        return;
+      }
       await apiFetch(`/api/campaigns/${selectedCampaign.id}/urls/import`, {
         method: "POST",
         body: JSON.stringify({ urls: urlsArray })
@@ -139,7 +214,11 @@ export default function Campaigns() {
   const handleImportTemplates = async () => {
     if (!bulkTemplates.trim()) return;
     try {
-      const templatesArray = bulkTemplates.split("\n").map(t => t.trim()).filter(Boolean);
+      const templatesArray = parseCommentTemplates(bulkTemplates);
+      if (templatesArray.length === 0) {
+        showToast("Không tìm thấy nội dung bình luận hợp lệ.", "error");
+        return;
+      }
       await apiFetch(`/api/campaigns/${selectedCampaign.id}/templates`, {
         method: "POST",
         body: JSON.stringify({ templates: templatesArray })
@@ -226,6 +305,20 @@ export default function Campaigns() {
     return s;
   };
 
+  const getJobStatusText = (s) => {
+    if (s === "SUCCESS") return "Thành công";
+    if (s === "FAILED") return "Thất bại";
+    if (s === "RUNNING") return "Đang chạy";
+    if (s === "QUEUED") return "Đang xếp hàng";
+    if (s === "RETRYING") return "Đang thử lại";
+    if (s === "CANCELLED") return "Đã hủy";
+    return s || "Chưa tạo job";
+  };
+
+  const getJobForUrl = (url) => {
+    return campaignJobs.find((job) => job.url_id === url.id || job.target_url === url.url);
+  };
+
   return (
     <div className="h-full grid grid-cols-1 lg:grid-cols-3 gap-6 items-start pb-8 animate-slide-in">
       
@@ -251,14 +344,12 @@ export default function Campaigns() {
       <div className="lg:col-span-1 space-y-4">
         <div className="flex justify-between items-center pr-1 pl-1">
           <h3 className="text-sm font-extrabold text-gray-900 uppercase tracking-wider">Danh mục chiến dịch</h3>
-          {userRole !== "VIEWER" && (
-            <button
-              onClick={() => setShowCreateModal(true)}
-              className="h-11 bg-[#3B82F6] hover:bg-blue-600 text-white font-extrabold px-4 rounded-md text-xs transition-all duration-200 hover:scale-105 cursor-pointer shadow-none"
-            >
-              + Tạo chiến dịch mới
-            </button>
-          )}
+          <button
+            onClick={() => setShowCreateModal(true)}
+            className="h-11 bg-[#3B82F6] hover:bg-blue-600 text-white font-extrabold px-4 rounded-md text-xs transition-all duration-200 hover:scale-105 cursor-pointer shadow-none"
+          >
+            + Tạo chiến dịch mới
+          </button>
         </div>
 
         {campaigns.length === 0 ? (
@@ -323,8 +414,7 @@ export default function Campaigns() {
                 <p className="text-gray-500 text-xs font-semibold mt-2">{selectedCampaign.description || "Không có mô tả chiến dịch."}</p>
               </div>
 
-              {userRole !== "VIEWER" && (
-                <div className="flex flex-wrap gap-2">
+              <div className="flex flex-wrap gap-2">
                   {selectedCampaign.status !== "RUNNING" ? (
                     <button
                       onClick={() => startCampaign(selectedCampaign.id)}
@@ -363,8 +453,7 @@ export default function Campaigns() {
                   >
                     Xóa
                   </button>
-                </div>
-              )}
+              </div>
             </div>
 
             {/* Campaign Metrics */}
@@ -397,44 +486,98 @@ export default function Campaigns() {
                   </span>
                 </div>
 
-                {userRole !== "VIEWER" && (
-                  <div className="space-y-2">
+                <div className="space-y-2">
                     <textarea
                       value={bulkUrls}
                       onChange={(e) => setBulkUrls(e.target.value)}
                       placeholder="Nhập danh sách bài viết (mỗi dòng một đường dẫn bài đăng, ví dụ: https://x.com/user/status/123)"
-                      rows="3"
+                      rows={3}
                       className="w-full bg-white border border-gray-200 rounded-md p-3.5 text-xs font-medium text-gray-900 focus:border-2 focus:border-[#3B82F6] focus:outline-none transition-all resize-none"
                     />
+                    {bulkUrls.trim() && (
+                      <div className={`rounded-md border px-3 py-2 text-[11px] font-bold ${
+                        parsedBulkUrls.length > 0
+                          ? "bg-emerald-50 border-emerald-200 text-emerald-700"
+                          : "bg-amber-50 border-amber-200 text-amber-700"
+                      }`}>
+                        Đã nhận {parsedBulkUrls.length} URL hợp lệ cho {selectedCampaign.platform}.
+                      </div>
+                    )}
                     <button
                       onClick={handleImportUrls}
-                      className="w-full h-11 bg-white hover:bg-gray-50 border border-gray-200 text-[#3B82F6] font-extrabold rounded-md text-xs transition-all duration-200 hover:scale-105 cursor-pointer shadow-none"
+                      disabled={Boolean(bulkUrls.trim()) && parsedBulkUrls.length === 0}
+                      className="w-full h-11 bg-white hover:bg-gray-50 border border-gray-200 text-[#3B82F6] font-extrabold rounded-md text-xs transition-all duration-200 hover:scale-105 cursor-pointer shadow-none disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:scale-100"
                     >
                       📥 Nhập danh sách bài đăng
                     </button>
-                  </div>
-                )}
+                </div>
 
                 <div className="bg-white border border-gray-200 rounded-md p-4 max-h-56 overflow-y-auto space-y-2 shadow-none">
                   {campaignUrls.length === 0 ? (
                     <p className="text-center text-gray-400 text-xs font-bold py-6">Chưa có bài đăng nào được nhập.</p>
                   ) : (
-                    campaignUrls.map((url) => (
-                      <div key={url.id} className="flex justify-between items-center p-3 bg-gray-50 rounded border border-gray-200 text-[11px] gap-2 shadow-none">
-                        <span className="truncate text-gray-900 font-mono font-bold" title={url.url}>{url.url}</span>
-                        <span className={`px-2 py-0.5 rounded text-[9px] font-extrabold uppercase ${
-                          url.status === "SUCCESS"
-                            ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-                            : url.status === "FAILED"
-                            ? "bg-red-50 text-red-700 border border-red-200"
-                            : url.status === "PROCESSING"
-                            ? "bg-blue-50 text-blue-700 border border-blue-200 animate-pulse"
-                            : "bg-gray-100 text-gray-600 border border-gray-200"
-                        }`}>
-                          {url.status === "SUCCESS" ? "Thành công" : url.status === "FAILED" ? "Thất bại" : url.status === "PROCESSING" ? "Đang xử lý" : url.status}
-                        </span>
-                      </div>
-                    ))
+                    campaignUrls.map((url) => {
+                      const job = getJobForUrl(url);
+                      const status = job?.status || url.status;
+                      const accountLabel = job?.account_username 
+                        ? `@${job.account_username}` 
+                        : (selectedCampaign.status === "DRAFT" || selectedCampaign.status === "READY")
+                        ? "Sẽ tự động gán khi chạy"
+                        : "Chưa gán tài khoản";
+
+                      return (
+                        <div key={url.id} className="p-3 bg-gray-50 rounded border border-gray-200 text-[11px] shadow-none space-y-2">
+                          <div className="flex justify-between items-start gap-3">
+                            <a
+                              href={url.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="min-w-0 flex-1 truncate text-[#3B82F6] hover:text-blue-700 hover:underline font-mono font-extrabold"
+                              title={url.url}
+                            >
+                              {url.url}
+                            </a>
+                            <span className={`shrink-0 px-2 py-0.5 rounded text-[9px] font-extrabold uppercase ${
+                              status === "SUCCESS"
+                                ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                                : status === "FAILED"
+                                ? "bg-red-50 text-red-700 border border-red-200"
+                                : status === "RUNNING" || status === "PROCESSING"
+                                ? "bg-blue-50 text-blue-700 border border-blue-200 animate-pulse"
+                                : status === "QUEUED" || status === "RETRYING"
+                                ? "bg-amber-50 text-amber-700 border border-amber-200"
+                                : "bg-gray-100 text-gray-600 border border-gray-200"
+                            }`}>
+                              {getJobStatusText(status)}
+                            </span>
+                          </div>
+
+                          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-gray-200 pt-2 text-[10px]">
+                            <span className="font-extrabold text-gray-700">
+                              Người xử lý: <span className="text-gray-900">{accountLabel}</span>
+                            </span>
+                            {job?.real_api && (
+                              <span className="rounded border border-emerald-200 bg-emerald-50 px-2 py-0.5 font-extrabold uppercase text-emerald-700">
+                                Cookie that
+                              </span>
+                            )}
+                            {job ? (
+                              <span className="font-bold text-gray-500">
+                                Thử {job.attempt_count}/3
+                              </span>
+                            ) : (
+                              <span className="font-bold text-gray-400">Job sẽ tạo khi chạy campaign</span>
+                            )}
+                          </div>
+
+                          {job?.error_message && (
+                            <p className="text-[10px] font-mono text-red-600 truncate" title={job.error_message}>
+                              Lỗi: {job.error_message}
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })
                   )}
                 </div>
               </div>
@@ -446,23 +589,31 @@ export default function Campaigns() {
                   <span className="text-[10px] text-gray-500 font-bold">Đã tải {campaignTemplates.length}</span>
                 </div>
 
-                {userRole !== "VIEWER" && (
-                  <div className="space-y-2">
+                <div className="space-y-2">
                     <textarea
                       value={bulkTemplates}
                       onChange={(e) => setBulkTemplates(e.target.value)}
                       placeholder="Nhập nội dung bình luận (mỗi dòng một nội dung bình luận khác nhau)"
-                      rows="3"
+                      rows={3}
                       className="w-full bg-white border border-gray-200 rounded-md p-3.5 text-xs font-medium text-gray-900 focus:border-2 focus:border-[#3B82F6] focus:outline-none transition-all resize-none"
                     />
+                    {bulkTemplates.trim() && (
+                      <div className={`rounded-md border px-3 py-2 text-[11px] font-bold ${
+                        parsedBulkTemplates.length > 0
+                          ? "bg-emerald-50 border-emerald-200 text-emerald-700"
+                          : "bg-amber-50 border-amber-200 text-amber-700"
+                      }`}>
+                        Đã nhận {parsedBulkTemplates.length} mẫu bình luận.
+                      </div>
+                    )}
                     <button
                       onClick={handleImportTemplates}
-                      className="w-full h-11 bg-white hover:bg-gray-50 border border-gray-200 text-[#3B82F6] font-extrabold rounded-md text-xs transition-all duration-200 hover:scale-105 cursor-pointer shadow-none"
+                      disabled={Boolean(bulkTemplates.trim()) && parsedBulkTemplates.length === 0}
+                      className="w-full h-11 bg-white hover:bg-gray-50 border border-gray-200 text-[#3B82F6] font-extrabold rounded-md text-xs transition-all duration-200 hover:scale-105 cursor-pointer shadow-none disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:scale-100"
                     >
                       📥 Nhập danh sách nội dung
                     </button>
-                  </div>
-                )}
+                </div>
 
                 <div className="bg-white border border-gray-200 rounded-md p-4 max-h-56 overflow-y-auto space-y-2 shadow-none">
                   {campaignTemplates.length === 0 ? (
@@ -486,14 +637,12 @@ export default function Campaigns() {
                   <p>⚠️ Chú ý: Một số tác vụ bình luận trong chiến dịch này đã gặp lỗi</p>
                   <p className="text-gray-500 text-[11px] font-semibold mt-1">Lỗi có thể xuất phát từ việc mất kết nối API mạng xã hội hoặc tài khoản bị giới hạn tần suất. Bạn có thể kích hoạt thử lại toàn bộ.</p>
                 </div>
-                {userRole !== "VIEWER" && (
-                  <button
-                    onClick={() => retryAllFailed(selectedCampaign.id)}
-                    className="h-10 bg-red-600 hover:bg-red-700 text-white font-extrabold px-4 rounded-md text-[11px] transition-all duration-200 hover:scale-105 cursor-pointer shrink-0 shadow-none"
-                  >
-                    Thử lại các tác vụ lỗi
-                  </button>
-                )}
+                <button
+                  onClick={() => retryAllFailed(selectedCampaign.id)}
+                  className="h-10 bg-red-600 hover:bg-red-700 text-white font-extrabold px-4 rounded-md text-[11px] transition-all duration-200 hover:scale-105 cursor-pointer shrink-0 shadow-none"
+                >
+                  Thử lại các tác vụ lỗi
+                </button>
               </div>
             )}
 
@@ -553,7 +702,7 @@ export default function Campaigns() {
                   value={newCampaignDesc}
                   onChange={(e) => setNewCampaignDesc(e.target.value)}
                   placeholder="Mô tả mục tiêu chiến dịch..."
-                  rows="3"
+                  rows={3}
                   className="w-full bg-gray-100 border border-gray-200 rounded-md p-3.5 text-xs font-medium text-gray-900 focus:bg-white focus:border-2 focus:border-[#3B82F6] focus:outline-none transition-all resize-none"
                 />
               </div>

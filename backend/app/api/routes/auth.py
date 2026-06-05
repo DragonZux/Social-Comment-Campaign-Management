@@ -18,7 +18,6 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
 
 class TokenData(BaseModel):
     username: Optional[str] = None
-    role: Optional[str] = None
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:
@@ -49,10 +48,9 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
         username: str = payload.get("sub")
-        role: str = payload.get("role")
-        if username is None or role is None:
+        if username is None:
             raise credentials_exception
-        token_data = TokenData(username=username, role=role)
+        token_data = TokenData(username=username)
     except JWTError:
         raise credentials_exception
     
@@ -61,16 +59,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     if user is None:
         raise credentials_exception
     return serialize_doc(user)
-
-def require_roles(allowed_roles: list[str]):
-    async def role_checker(current_user: dict = Depends(get_current_user)):
-        if current_user.get("role") not in allowed_roles:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You do not have permission to access this resource"
-            )
-        return current_user
-    return role_checker
 
 # Helper to write audit log
 async def write_audit_log(user_id: str, username: str, action: str, resource_type: str, resource_id: str = None, old_val: str = None, new_val: str = None):
@@ -102,7 +90,6 @@ async def register(user_in: UserRegister):
     user_doc = {
         "username": user_in.username,
         "hashed_password": hashed_pwd,
-        "role": user_in.role,
         "created_at": datetime.utcnow()
     }
     result = await db.users.insert_one(user_doc)
@@ -111,11 +98,10 @@ async def register(user_in: UserRegister):
     await write_audit_log(str(result.inserted_id), user_in.username, "REGISTER", "USER", str(result.inserted_id))
     
     # Generate token
-    access_token = create_access_token(data={"sub": user_in.username, "role": user_in.role})
+    access_token = create_access_token(data={"sub": user_in.username})
     return {
         "access_token": access_token,
         "token_type": "bearer",
-        "role": user_in.role,
         "username": user_in.username
     }
 
@@ -132,8 +118,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
             detail="Incorrect username or password"
         )
     
-    role = user.get("role", "OPERATOR")
-    access_token = create_access_token(data={"sub": user["username"], "role": role})
+    access_token = create_access_token(data={"sub": user["username"]})
     
     # Write audit log
     await write_audit_log(str(user["_id"]), user["username"], "LOGIN", "USER", str(user["_id"]))
@@ -141,6 +126,5 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {
         "access_token": access_token,
         "token_type": "bearer",
-        "role": role,
         "username": user["username"]
     }

@@ -445,8 +445,8 @@ export default function Dashboard() {
                       <td className="py-3.5 px-4 max-w-[180px] truncate text-slate-500 font-medium" title={job.target_url}>
                         {job.target_url}
                       </td>
-                      <td className="py-3.5 px-4 max-w-[220px] truncate text-slate-600 font-medium" title={job.template_content}>
-                        "{job.template_content}"
+                      <td className="py-3.5 px-4 max-w-[220px] truncate text-slate-600 font-medium" title={job.commented_text || job.template_content}>
+                        "{job.commented_text || job.template_content}"
                       </td>
                       <td className="py-3.5 px-4">
                         <span

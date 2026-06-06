@@ -431,11 +431,14 @@ async def post_to_x_playwright(
             page = await context.new_page()
             logger.info(f"Opening X post page: {target_url}")
             try:
-                await page.goto(target_url, wait_until="networkidle", timeout=60000)
-            except Exception:
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+            except Exception:
+                await page.goto(target_url, wait_until="load", timeout=45000)
 
-            await page.wait_for_timeout(3000)
+            try:
+                await page.locator("article").first.wait_for(state="visible", timeout=20000)
+            except Exception:
+                await page.wait_for_timeout(3000)
             current_url = page.url.lower()
             if "flow/login" in current_url or "/login" in current_url:
                 await capture_debug(page, "login_redirect")
@@ -593,7 +596,15 @@ async def post_to_threads_playwright(
                 if aria_disabled == "true" or disabled is not None:
                     logger.debug(f"Skipping disabled Threads {description} candidate #{index + 1}")
                     continue
-                await candidate.click()
+                try:
+                    await candidate.click(timeout=5000)
+                except Exception as click_err:
+                    if "intercepts pointer events" not in str(click_err) and "Timeout" not in str(click_err):
+                        raise
+                    logger.warning(
+                        f"Normal click for Threads {description} candidate #{index + 1} was blocked; retrying with force click."
+                    )
+                    await candidate.click(force=True, timeout=5000)
                 logger.info(f"Clicked Threads {description} candidate #{index + 1}")
                 return True
             except Exception as e:
@@ -611,64 +622,213 @@ async def post_to_threads_playwright(
                 continue
         return None
 
-    async def try_submit_strategies(page, dialog_scope=None) -> bool:
+    async def last_visible(locator):
+        count = await locator.count()
+        for index in range(count - 1, -1, -1):
+            candidate = locator.nth(index)
+            try:
+                if await candidate.is_visible():
+                    return candidate
+            except Exception:
+                continue
+        return None
+
+    async def visible_text_exists(scope, text: str) -> bool:
+        candidates = scope.locator("div[contenteditable='true'], [role='textbox'], p[contenteditable='true'], textarea")
+        count = await candidates.count()
+        for index in range(count):
+            candidate = candidates.nth(index)
+            try:
+                if not await candidate.is_visible():
+                    continue
+                candidate_text = (await candidate.inner_text()).strip()
+                if text in candidate_text:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def editor_contains_text(editor, text: str) -> bool:
+        try:
+            editor_text = (await editor.inner_text()).strip()
+            if text in editor_text:
+                return True
+        except Exception:
+            pass
+        try:
+            editor_value = (await editor.input_value()).strip()
+            if text in editor_value:
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def find_threads_reply_editor(locator):
+        candidates = []
+        count = await locator.count()
+        for index in range(count):
+            candidate = locator.nth(index)
+            try:
+                if not await candidate.is_visible():
+                    continue
+                text = ""
+                try:
+                    text = (await candidate.inner_text()).strip()
+                except Exception:
+                    pass
+                attrs = []
+                for attr in ["aria-label", "aria-placeholder", "placeholder", "data-placeholder"]:
+                    try:
+                        attrs.append(await candidate.get_attribute(attr) or "")
+                    except Exception:
+                        attrs.append("")
+                haystack = " ".join([text, *attrs]).lower()
+                score = 0
+                if any(word in haystack for word in ["reply", "trả lời", "tra loi"]):
+                    score += 30
+                if any(word in haystack for word in ["community", "topic", "cộng đồng", "chu de", "chủ đề"]):
+                    score -= 50
+                if text == "":
+                    score += 5
+                candidates.append((score, index, candidate, haystack[:120]))
+            except Exception as e:
+                logger.debug(f"Skipping Threads editor candidate #{index + 1}: {e}")
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        score, index, candidate, details = candidates[0]
+        logger.info(f"Selected Threads editor candidate #{index + 1} with score {score}: {details}")
+        return candidate
+
+    async def click_near_editor_submit(page, editor) -> bool:
+        try:
+            editor_box = await editor.bounding_box()
+            if not editor_box:
+                return False
+            editor_center_y = editor_box["y"] + editor_box["height"] / 2
+            controls = page.locator("button, div[role='button']")
+            candidates = []
+            count = await controls.count()
+            for index in range(count):
+                control = controls.nth(index)
+                try:
+                    if not await control.is_visible():
+                        continue
+                    aria_disabled = await control.get_attribute("aria-disabled")
+                    disabled = await control.get_attribute("disabled")
+                    if aria_disabled == "true" or disabled is not None:
+                        continue
+                    box = await control.bounding_box()
+                    if not box:
+                        continue
+                    center_y = box["y"] + box["height"] / 2
+                    if abs(center_y - editor_center_y) > 80:
+                        continue
+                    if box["x"] <= editor_box["x"]:
+                        continue
+                    if box["x"] > editor_box["x"] + max(900, editor_box["width"] + 300):
+                        continue
+
+                    text = ""
+                    aria = ""
+                    try:
+                        text = (await control.inner_text()).strip()
+                    except Exception:
+                        pass
+                    try:
+                        aria = await control.get_attribute("aria-label") or ""
+                    except Exception:
+                        pass
+                    label = f"{text} {aria}".lower()
+                    if any(skip in label for skip in ["cancel", "more", "menu", "close", "search"]):
+                        continue
+
+                    distance = abs((box["x"] + box["width"] / 2) - (editor_box["x"] + editor_box["width"]))
+                    score = 1000 - distance
+                    if text == "":
+                        score += 50
+                    if any(word in label for word in ["post", "send", "đăng", "gửi"]):
+                        score += 100
+                    candidates.append((score, index, control, text[:40], aria[:80]))
+                except Exception as e:
+                    logger.debug(f"Skipping nearby submit candidate #{index + 1}: {e}")
+
+            if not candidates:
+                return False
+
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            _, index, control, text, aria = candidates[0]
+            logger.info(f"Clicking nearby Threads submit candidate #{index + 1}: text='{text}', aria='{aria}'")
+            try:
+                await control.click(timeout=5000)
+            except Exception as click_err:
+                if "intercepts pointer events" not in str(click_err) and "Timeout" not in str(click_err):
+                    raise
+                await control.click(force=True, timeout=5000)
+            return True
+        except Exception as e:
+            logger.warning(f"Could not click nearby Threads submit control: {e}")
+            return False
+
+    async def try_submit_strategies(page, dialog_scope=None, editor=None) -> bool:
         """Try multiple strategies to find and click the submit/post button."""
         scope = dialog_scope if dialog_scope else page
 
         # Strategy 1: role-based button matching common labels
-        submit_pattern = re.compile(r"^(post|reply|đăng|gửi|trả lời)$", re.IGNORECASE)
+        submit_pattern = re.compile(r"^(post|đăng|gửi)$", re.IGNORECASE)
         if await click_first_visible(
             scope.get_by_role("button", name=submit_pattern),
             "submit role button",
         ):
             return True
 
-        # Strategy 2: CSS selector with has-text
+        # Strategy 2: inline Threads composer uses an icon-only submit control beside the editor
+        if editor is not None and await click_near_editor_submit(page, editor):
+            return True
+
+        # Strategy 3: CSS selector with has-text
         text_selectors = (
-            "button:has-text('Post'), button:has-text('Reply'), "
-            "button:has-text('Đăng'), button:has-text('Gửi'), button:has-text('Trả lời'), "
-            "div[role='button']:has-text('Post'), div[role='button']:has-text('Reply'), "
-            "div[role='button']:has-text('Đăng'), div[role='button']:has-text('Gửi'), "
-            "div[role='button']:has-text('Trả lời')"
+            "button:has-text('Post'), "
+            "button:has-text('Đăng'), button:has-text('Gửi'), "
+            "div[role='button']:has-text('Post'), "
+            "div[role='button']:has-text('Đăng'), div[role='button']:has-text('Gửi')"
         )
         if await click_first_visible(scope.locator(text_selectors), "submit text button"):
             return True
 
-        # Strategy 3: aria-label based selectors (Threads often uses aria-label)
+        # Strategy 4: aria-label based selectors (Threads often uses aria-label)
         aria_selectors = (
-            "[aria-label='Post'], [aria-label='Reply'], "
-            "[aria-label='Đăng'], [aria-label='Gửi'], [aria-label='Trả lời'], "
-            "[aria-label='post'], [aria-label='reply']"
+            "[aria-label='Post'], "
+            "[aria-label='Đăng'], [aria-label='Gửi'], "
+            "[aria-label='post']"
         )
         if await click_first_visible(scope.locator(aria_selectors), "submit aria-label button"):
             return True
 
-        # Strategy 4: data-testid based (Threads/Instagram often use testids)
+        # Strategy 5: data-testid based (Threads/Instagram often use testids)
         testid_selectors = (
-            "[data-testid*='post'], [data-testid*='reply'], [data-testid*='submit'], "
-            "[data-testid*='send'], [data-testid*='Post'], [data-testid*='Reply']"
+            "[data-testid*='post'], [data-testid*='submit'], "
+            "[data-testid*='send'], [data-testid*='Post']"
         )
         if await click_first_visible(scope.locator(testid_selectors), "submit data-testid button"):
             return True
 
-        # Strategy 5: XPath text content matching (more flexible text search)
+        # Strategy 6: XPath text content matching (more flexible text search)
         xpath_patterns = [
             "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'post')]",
-            "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'reply')]",
             "//div[@role='button'][contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'post')]",
-            "//div[@role='button'][contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'reply')]",
             "//button[contains(text(),'Đăng')]",
             "//button[contains(text(),'Gửi')]",
-            "//button[contains(text(),'Trả lời')]",
             "//div[@role='button'][contains(text(),'Đăng')]",
             "//div[@role='button'][contains(text(),'Gửi')]",
-            "//div[@role='button'][contains(text(),'Trả lời')]",
         ]
         for xpath in xpath_patterns:
             if await click_first_visible(scope.locator(f"xpath={xpath}"), f"submit xpath ({xpath[:40]})"):
                 return True
 
-        # Strategy 6: Look for any enabled button near the editor/textbox area
+        # Strategy 7: Look for any enabled button near the editor/textbox area
         # Threads sometimes wraps the submit in a span or uses non-standard elements
         nearby_selectors = (
             "form button:not([disabled]), "
@@ -766,7 +926,12 @@ async def post_to_threads_playwright(
                             try:
                                 parent = svg_reply.nth(i).locator("..")
                                 if await parent.is_visible():
-                                    await parent.click()
+                                    try:
+                                        await parent.click(timeout=5000)
+                                    except Exception as click_err:
+                                        if "intercepts pointer events" not in str(click_err) and "Timeout" not in str(click_err):
+                                            raise
+                                        await parent.click(force=True, timeout=5000)
                                     reply_clicked = True
                                     logger.info(f"Clicked SVG reply parent element #{i + 1}")
                                     break
@@ -814,15 +979,21 @@ async def post_to_threads_playwright(
             # 2. Select the editor
             if dialog_visible:
                 logger.info("Reply dialog is open. Selecting editor inside the dialog.")
-                editor = await first_visible(dialog.locator(editor_selector))
+                editor = await find_threads_reply_editor(dialog.locator(editor_selector))
             else:
                 logger.info("Using inline Threads reply composer.")
-                editor = await first_visible(page.locator(editor_selector))
+                editor = await find_threads_reply_editor(page.locator(editor_selector))
 
             if not editor:
                 raise SocialAuthError("Khong tim thay o nhap binh luan Threads sau khi mo composer.")
 
-            await editor.click()
+            try:
+                await editor.click(timeout=5000)
+            except Exception as click_err:
+                if "intercepts pointer events" not in str(click_err) and "Timeout" not in str(click_err):
+                    raise
+                logger.warning("Normal click for Threads editor was blocked; retrying with force click.")
+                await editor.click(force=True, timeout=5000)
             await page.wait_for_timeout(500)
 
             logger.info(f"Entering comment text: {comment_content}")
@@ -830,12 +1001,23 @@ async def post_to_threads_playwright(
                 await editor.fill(comment_content)
             except Exception:
                 try:
-                    await editor.press_sequentially(comment_content, delay=50)
-                except Exception:
                     await page.keyboard.insert_text(comment_content)
+                except Exception:
+                    await editor.press_sequentially(comment_content, delay=50)
 
             # Wait for the text to be entered and submit button to become active
             await page.wait_for_timeout(1500)
+            text_scope = dialog if dialog_visible else page
+            if not await editor_contains_text(editor, comment_content):
+                try:
+                    await editor.click(force=True, timeout=5000)
+                    await page.keyboard.insert_text(comment_content)
+                    await page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+
+            if not await editor_contains_text(editor, comment_content):
+                raise RuntimeError("Threads composer did not receive the comment text before submit.")
 
             # Try to find and click submit button
             clicked_submit = False
@@ -844,12 +1026,12 @@ async def post_to_threads_playwright(
             dialog = page.locator("[role='dialog']").last
             if await dialog.count() > 0 and await dialog.is_visible():
                 logger.info("Found visible dialog, trying submit strategies within dialog...")
-                clicked_submit = await try_submit_strategies(page, dialog_scope=dialog)
+                clicked_submit = await try_submit_strategies(page, dialog_scope=dialog, editor=editor)
 
             # If no dialog submit found, try page-wide
             if not clicked_submit:
                 logger.info("Trying submit strategies on full page...")
-                clicked_submit = await try_submit_strategies(page)
+                clicked_submit = await try_submit_strategies(page, editor=editor)
 
             # Last resort: try pressing Enter or Ctrl+Enter
             if not clicked_submit:
@@ -905,49 +1087,87 @@ async def post_to_threads_playwright(
                 )
 
             logger.info("Clicked submit/post. Waiting for comment to be processed...")
-            await page.wait_for_timeout(4000)
 
-            # Verify the comment was actually posted
+            # Verify the comment was actually posted. "Posting..." is a transient Threads state,
+            # not an error, so keep waiting while it is visible.
             post_verified = False
             verification_msg = ""
+            real_error_detected = False
+            transient_markers = ("posting", "sending", "loading", "dang dang", "dang gui", "đang đăng", "đang gửi")
 
-            # Check 1: Editor should be cleared or hidden after successful post
-            try:
-                editor_visible = await editor.is_visible()
-                if editor_visible:
-                    editor_text = (await editor.inner_text()).strip()
-                    if editor_text == "" or editor_text != comment_content:
-                        post_verified = True
-                        verification_msg = "Editor cleared after submit"
-                else:
-                    post_verified = True
-                    verification_msg = "Editor hidden after submit (dialog closed)"
-            except Exception:
-                # Editor might have been removed from DOM = success
-                post_verified = True
-                verification_msg = "Editor no longer in DOM"
-
-            # Check 2: Look for error messages from Threads
             error_indicators = page.locator(
                 "[role='alert'], [data-testid*='error'], [data-testid*='toast'], "
                 "div:has-text('couldn\\'t'), div:has-text('không thể'), "
                 "div:has-text('try again'), div:has-text('thử lại'), "
-                "div:has-text('restricted'), div:has-text('hạn chế')"
+                "div:has-text('restricted'), div:has-text('hạn chế'), "
+                "div:has-text('Posting'), div:has-text('posting')"
             )
-            try:
-                error_count = await error_indicators.count()
-                for idx in range(min(error_count, 5)):
-                    el = error_indicators.nth(idx)
-                    if await el.is_visible():
-                        err_text = await el.inner_text()
-                        if err_text.strip() and len(err_text.strip()) < 200:
-                            post_verified = False
-                            verification_msg = f"Threads error detected: {err_text.strip()[:100]}"
-                            logger.warning(f"Threads error after submit: {err_text.strip()[:100]}")
-                            break
-            except Exception:
-                pass
 
+            for verify_round in range(2):
+                for _ in range(12):
+                    await page.wait_for_timeout(2000)
+
+                    try:
+                        editor_visible = await editor.is_visible()
+                        if editor_visible:
+                            editor_text = (await editor.inner_text()).strip()
+                            if editor_text == "" or editor_text != comment_content:
+                                post_verified = True
+                                verification_msg = "Editor cleared after submit"
+                                break
+                        else:
+                            post_verified = True
+                            verification_msg = "Editor hidden after submit (dialog closed)"
+                            break
+                    except Exception:
+                        post_verified = True
+                        verification_msg = "Editor no longer in DOM"
+                        break
+
+                    try:
+                        error_count = await error_indicators.count()
+                        for idx in range(min(error_count, 8)):
+                            el = error_indicators.nth(idx)
+                            if not await el.is_visible():
+                                continue
+                            err_text = (await el.inner_text()).strip()
+                            if not err_text or len(err_text) >= 200:
+                                continue
+                            err_lower = err_text.lower()
+                            if any(marker in err_lower for marker in transient_markers):
+                                verification_msg = f"Threads is still posting: {err_text[:100]}"
+                                logger.info(verification_msg)
+                                continue
+
+                            post_verified = False
+                            real_error_detected = True
+                            verification_msg = f"Threads error detected: {err_text[:100]}"
+                            logger.warning(f"Threads error after submit: {err_text[:100]}")
+                            break
+                        if real_error_detected:
+                            break
+                    except Exception:
+                        pass
+
+                if post_verified or real_error_detected:
+                    break
+
+                if verify_round == 0:
+                    logger.warning("Threads submit was not verified yet; trying one more submit action.")
+                    retry_clicked = False
+                    try:
+                        dialog = page.locator("[role='dialog']").last
+                        if await dialog.count() > 0 and await dialog.is_visible():
+                            retry_clicked = await try_submit_strategies(page, dialog_scope=dialog, editor=editor)
+                        if not retry_clicked:
+                            retry_clicked = await try_submit_strategies(page, editor=editor)
+                        if not retry_clicked:
+                            await page.keyboard.press("Control+Enter")
+                            retry_clicked = True
+                        if retry_clicked:
+                            verification_msg = "Retried submit action; waiting for composer to clear."
+                    except Exception as retry_submit_err:
+                        logger.warning(f"Could not retry Threads submit action: {retry_submit_err}")
             # Capture post-submit screenshot for debugging
             try:
                 debug_dir = tempfile.gettempdir()
@@ -964,6 +1184,10 @@ async def post_to_threads_playwright(
                 logger.info(f"Comment posting verified: {verification_msg}")
             else:
                 logger.warning(f"Comment may not have been posted: {verification_msg}")
+                raise RuntimeError(
+                    "Threads comment submit could not be verified after clicking Post. "
+                    f"{verification_msg or 'The composer did not clearly close or clear.'}"
+                )
 
             return {
                 "provider": "playwright_browser_automation",
@@ -1039,7 +1263,7 @@ async def mock_post_comment(
             logger.error(f"[{platform}] Official API posting failed: {str(e)}")
             raise e
 
-    has_real_cookie = cookie and len(cookie) > 20 and not cookie.lower().startswith("mock")
+    has_real_cookie = cookie and len(cookie) > 20 and "mock" not in cookie.lower()
 
     if has_real_cookie:
         try:
@@ -1152,6 +1376,7 @@ async def check_account_connection(
         cookies_dict = parse_cookie_to_dict(cookie)
         
         if platform == "X":
+            is_mock_cookie = not cookie or "mock" in cookie.lower() or len(cookie) <= 20
             csrf_token = cookies_dict.get("ct0")
             auth_token = cookies_dict.get("auth_token")
             missing = []
@@ -1161,6 +1386,9 @@ async def check_account_connection(
                 missing.append("'auth_token'")
             if missing:
                 return False, f"Cookie thiếu trường {', '.join(missing)} của X. Vui lòng cấu hình đầy đủ."
+            
+            if is_mock_cookie:
+                return True, "Cookie hợp lệ (MÔ PHỎNG). Đã kết nối tài khoản X thành công."
             
             cookie_count = len(cookies_dict)
             return True, f"Cookie X da du auth_token va ct0. Da nhan {cookie_count} cookies."
@@ -1296,7 +1524,14 @@ async def fetch_real_latest_post(platform: str, page_url: str, cookie_str: Optio
             await browser.close()
 
 
-async def mock_fetch_latest_post(platform: str, page_url: str, existing_urls: list[str], cookie_str: Optional[str] = None, proxy: Optional[str] = None) -> str:
+async def mock_fetch_latest_post(
+    platform: str,
+    page_url: str,
+    existing_urls: list[str],
+    cookie_str: Optional[str] = None,
+    proxy: Optional[str] = None,
+    allow_real_fallback: bool = True,
+) -> Optional[str]:
     """
     Tries to scrape the actual latest post from the page.
     If it fails or if it's in simulation mode (cookie_str is a mock), falls back to simulation.
@@ -1305,7 +1540,7 @@ async def mock_fetch_latest_post(platform: str, page_url: str, existing_urls: li
     is_mock_page = "mock" in page_url.lower() or "example" in page_url.lower() or ("@" not in page_url and "/" not in page_url)
     is_mock_cookie = not cookie_str or "mock" in cookie_str.lower() or len(cookie_str) <= 20
     
-    if is_mock_page or (platform == "X" and is_mock_cookie):
+    if is_mock_page or is_mock_cookie:
         # Fallback simulated
         username = "social_user"
         match = re.search(r"(?:x\.com|twitter\.com|threads\.net|threads\.com)/@?([A-Za-z0-9_\.]+)", page_url, re.IGNORECASE)
@@ -1333,6 +1568,8 @@ async def mock_fetch_latest_post(platform: str, page_url: str, existing_urls: li
         real_url = await fetch_real_latest_post(platform, page_url, cookie_str, proxy)
         return real_url
     except Exception as e:
+        if not allow_real_fallback:
+            raise
         logger.warning(f"Failed to fetch real latest post for {page_url}: {e}. Falling back to simulation...")
         # Fallback simulation
         username = "social_user"

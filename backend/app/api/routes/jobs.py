@@ -83,7 +83,8 @@ async def list_jobs(
             "real_api": 1,
             "account_username": "$account.username",
             "target_url": "$url.url",
-            "template_content": "$template.content"
+            "template_content": "$template.content",
+            "commented_text": 1
         }},
         {"$sort": {"scheduled_time": -1}}
     ]
@@ -151,7 +152,8 @@ async def get_job(
             "real_api": 1,
             "account_username": "$account.username",
             "target_url": "$url.url",
-            "template_content": "$template.content"
+            "template_content": "$template.content",
+            "commented_text": 1
         }}
     ]
     

@@ -20,3 +20,4 @@ class JobOut(BaseModel):
     account_username: Optional[str] = None
     target_url: Optional[str] = None
     template_content: Optional[str] = None
+    commented_text: Optional[str] = None

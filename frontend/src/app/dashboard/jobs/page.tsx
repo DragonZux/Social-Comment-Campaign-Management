@@ -58,10 +58,25 @@ export default function Jobs() {
 
   // Poll job data
   useEffect(() => {
-    fetchJobs();
-    timerRef.current = setInterval(fetchJobs, 3000);
+    let active = true;
+    const pollJobs = async () => {
+      try {
+        const endpoint = filterStatus ? `/api/jobs?status=${filterStatus}` : "/api/jobs";
+        const list = await apiFetch(endpoint);
+        if (!active) return;
+        setJobs(list);
+      } catch (err) {
+        console.warn(err);
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+
+    pollJobs();
+    const timer = setInterval(pollJobs, 3000);
     return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
+      active = false;
+      clearInterval(timer);
     };
   }, [filterStatus]);
 
@@ -190,7 +205,9 @@ export default function Jobs() {
                     </td>
                     <td className="py-4 px-6 font-bold">@{job.account_username || "dynamic"}</td>
                     <td className="py-4 px-6 max-w-xs truncate text-gray-600" title={job.target_url}>{job.target_url}</td>
-                    <td className="py-4 px-6 max-w-xs truncate text-gray-600" title={job.template_content}>"{job.template_content}"</td>
+                    <td className="py-4 px-6 max-w-xs truncate text-gray-600" title={job.commented_text || job.template_content}>
+                      "{job.commented_text || job.template_content}"
+                    </td>
                     <td className="py-4 px-6">
                       <span className={`px-2.5 py-1 rounded text-[9px] font-extrabold uppercase ${
                         job.status === "SUCCESS" 

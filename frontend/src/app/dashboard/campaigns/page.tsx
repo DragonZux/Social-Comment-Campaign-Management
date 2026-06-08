@@ -15,7 +15,10 @@ const uniqueList = (items: string[]): string[] => Array.from(new Set(items));
 
 const formatVietnamDateTime = (value) => {
   if (!value) return "";
-  return new Date(value).toLocaleString("vi-VN", {
+  const dateValue = typeof value === "string" && /^\d{4}-\d{2}-\d{2}T/.test(value) && !(/[zZ]|[+-]\d{2}:\d{2}$/.test(value))
+    ? `${value}Z`
+    : value;
+  return new Date(dateValue).toLocaleString("vi-VN", {
     timeZone: "Asia/Ho_Chi_Minh",
     hour12: false,
   });
@@ -78,8 +81,8 @@ const extractUrlsFromText = (value, platform) => {
     .map((url) => url.replace(/^https:\/\/threads\.com\//i, "https://www.threads.com/"))
     .map((url) => url.replace(/^https:\/\/threads\.net\//i, "https://www.threads.net/"))
     .filter((url) => {
-      if (platform === "X") return /https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\//i.test(url);
-      if (platform === "Threads") return /https?:\/\/(?:www\.)?threads\.(?:net|com)\//i.test(url);
+      if (platform === "X") return /https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\/[^/\s]+\/status\/\d+/i.test(url);
+      if (platform === "Threads") return /https?:\/\/(?:www\.)?threads\.(?:net|com)\/@?[^/\s]+\/(?:post|t)\//i.test(url);
       return true;
     });
 
@@ -295,7 +298,7 @@ export default function Campaigns() {
     try {
       const urlsArray = extractUrlsFromText(bulkUrls, selectedCampaign?.platform);
       if (urlsArray.length === 0) {
-        showToast("Không tìm thấy URL hợp lệ cho nền tảng chiến dịch này.", "error");
+        showToast("Không tìm thấy link bài viết hợp lệ. Link profile hãy nhập ở phần Link trang cần giám sát.", "error");
         return;
       }
       await apiFetch(`/api/campaigns/${selectedCampaign.id}/urls/import`, {
@@ -469,9 +472,14 @@ export default function Campaigns() {
     if (jobs.some((job) => job.status === "QUEUED")) return "QUEUED";
     if (jobs.some((job) => job.status === "RETRYING")) return "RETRYING";
     if (jobs.some((job) => job.status === "FAILED")) return "FAILED";
+    if (jobs.some((job) => job.status === "CANCELLED")) return "CANCELLED";
     if (jobs.every((job) => job.status === "SUCCESS")) return "SUCCESS";
     return jobs[jobs.length - 1]?.status || urlStatus;
   };
+
+  const getStatusForUrl = (url) => getStatusForUrlJobs(getJobsForUrl(url), url.status);
+
+  const completedUrlCount = campaignUrls.filter((url) => getStatusForUrl(url) === "SUCCESS").length;
 
   const updateRepeatSchedule = async (payload) => {
     try {
@@ -646,35 +654,41 @@ export default function Campaigns() {
               </div>
             </div>
 
-            {/* Campaign Configuration Panel (Editable when DRAFT, READY, PAUSED) */}
-            {(selectedCampaign.status === "DRAFT" || selectedCampaign.status === "READY" || selectedCampaign.status === "PAUSED") ? (
+            {/* Campaign Configuration Panel */}
+            {(["DRAFT", "READY", "PAUSED"].includes(selectedCampaign.status) || selectedCampaign.campaign_type === "MONITOR") ? (
               <div className="bg-white border border-gray-200 p-5 rounded-md text-xs font-bold text-gray-600 space-y-4 shadow-none">
                 <h4 className="text-xs font-extrabold uppercase tracking-widest text-gray-500 border-b pb-2">Cấu hình giám sát & Thông tin</h4>
                 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
                     <label className="block mb-1.5 ml-0.5 text-gray-500">Loại chiến dịch</label>
-                    <select
-                      value={selectedCampaign.campaign_type || "STATIC"}
-                      onChange={async (e) => {
-                        const newType = e.target.value;
-                        try {
-                          await apiFetch(`/api/campaigns/${selectedCampaign.id}`, {
-                            method: "PATCH",
-                            body: JSON.stringify({ campaign_type: newType })
-                          });
-                          showToast("Cập nhật loại chiến dịch thành công!");
-                          const updated = await apiFetch(`/api/campaigns/${selectedCampaign.id}`);
-                          setSelectedCampaign(updated);
-                        } catch (err: any) {
-                          showToast(err.message, "error");
-                        }
-                      }}
-                      className="w-full h-10 bg-gray-55 border border-gray-200 rounded px-3 text-xs font-bold text-gray-900 focus:bg-white focus:outline-none cursor-pointer"
-                    >
-                      <option value="STATIC">Thủ công (Nhập bài đăng trực tiếp)</option>
-                      <option value="MONITOR">Tự động (Giám sát trang bài viết mới nhất)</option>
-                    </select>
+                    {["DRAFT", "READY", "PAUSED"].includes(selectedCampaign.status) ? (
+                      <select
+                        value={selectedCampaign.campaign_type || "STATIC"}
+                        onChange={async (e) => {
+                          const newType = e.target.value;
+                          try {
+                            await apiFetch(`/api/campaigns/${selectedCampaign.id}`, {
+                              method: "PATCH",
+                              body: JSON.stringify({ campaign_type: newType })
+                            });
+                            showToast("Cập nhật loại chiến dịch thành công!");
+                            const updated = await apiFetch(`/api/campaigns/${selectedCampaign.id}`);
+                            setSelectedCampaign(updated);
+                          } catch (err: any) {
+                            showToast(err.message, "error");
+                          }
+                        }}
+                        className="w-full h-10 bg-gray-55 border border-gray-200 rounded px-3 text-xs font-bold text-gray-900 focus:bg-white focus:outline-none cursor-pointer"
+                      >
+                        <option value="STATIC">Thủ công (Nhập bài đăng trực tiếp)</option>
+                        <option value="MONITOR">Tự động (Giám sát trang bài viết mới nhất)</option>
+                      </select>
+                    ) : (
+                      <div className="h-10 flex items-center bg-gray-55 border border-gray-200 rounded px-3 text-xs font-extrabold text-gray-900">
+                        Tự động (Giám sát trang bài viết mới nhất)
+                      </div>
+                    )}
                   </div>
 
                   {selectedCampaign.campaign_type === "MONITOR" && (
@@ -840,7 +854,7 @@ export default function Campaigns() {
                 <div className="flex justify-between items-center px-1">
                   <h4 className="text-xs font-extrabold uppercase tracking-widest text-gray-500">Đường dẫn bài viết (URLs)</h4>
                   <span className="text-[10px] text-gray-500 font-bold">
-                    Hoàn thành {campaignUrls.filter(u => u.status === "SUCCESS").length} / {campaignUrls.length}
+                    Hoàn thành {completedUrlCount} / {campaignUrls.length}
                   </span>
                 </div>
 
@@ -991,8 +1005,19 @@ export default function Campaigns() {
                               <div className="mt-1.5 bg-white border border-gray-100 rounded p-2 text-gray-700 font-semibold shadow-none text-[10px] space-y-1">
                                 <span className="font-extrabold text-gray-400 block text-[9px] uppercase tracking-wider mb-0.5">Nội dung đã comment:</span>
                                 {successJobs.map((item, index) => (
-                                  <div key={item.id || `${url.id}-${index}`} className="truncate" title={item.commented_text || item.template_content || ""}>
-                                    {index + 1}. "{item.commented_text || item.template_content}"
+                                  <div
+                                    key={item.id || `${url.id}-${index}`}
+                                    className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-0.5 sm:gap-2"
+                                    title={`${item.commented_text || item.template_content || ""}${item.completed_at ? ` - ${formatVietnamDateTime(item.completed_at)}` : ""}`}
+                                  >
+                                    <span className="truncate">
+                                      {index + 1}. "{item.commented_text || item.template_content}"
+                                    </span>
+                                    {item.completed_at && (
+                                      <span className="shrink-0 font-mono text-[9px] font-extrabold text-gray-400">
+                                        {formatVietnamDateTime(item.completed_at)}
+                                      </span>
+                                    )}
                                   </div>
                                 ))}
                               </div>

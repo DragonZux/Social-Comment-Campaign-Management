@@ -52,6 +52,17 @@ def get_monitor_page_urls(campaign: dict) -> List[str]:
     )
 
 
+def is_valid_target_post_url(url: str, platform: str) -> bool:
+    lowered = url.lower()
+    if platform == "X":
+        return ("x.com/" in lowered or "twitter.com/" in lowered) and "/status/" in lowered
+    if platform == "Threads":
+        return ("threads.net/" in lowered or "threads.com/" in lowered) and (
+            "/post/" in lowered or "/t/" in lowered
+        )
+    return False
+
+
 def campaign_scope(current_user: dict) -> dict:
     return {"owner_id": ObjectId(current_user["id"])}
 
@@ -122,6 +133,7 @@ async def create_campaign(
         "last_monitored_at": None,
         "repeat_enabled": bool(campaign_in.repeat_enabled),
         "repeat_interval_minutes": campaign_in.repeat_interval_minutes,
+        "comment_template_cursor": 0,
         "next_run_at": None,
         "last_repeat_run_at": None,
         "created_by": current_user["username"],
@@ -270,6 +282,7 @@ async def import_urls(
         
     inserted_urls = []
     duplicates_count = 0
+    invalid_count = 0
     
     for url in url_import.urls:
         url = url.strip()
@@ -279,6 +292,9 @@ async def import_urls(
             url = "https://www.threads.com/" + url[len("https://threads.com/"):]
         elif url.lower().startswith("https://threads.net/"):
             url = "https://www.threads.net/" + url[len("https://threads.net/"):]
+        if not is_valid_target_post_url(url, campaign["platform"]):
+            invalid_count += 1
+            continue
         # Deduplicate
         existing = await db.target_urls.find_one({"campaign_id": ObjectId(campaign_id), "url": url})
         if existing:
@@ -301,7 +317,7 @@ async def import_urls(
     await write_audit_log(
         current_user["id"], current_user["username"],
         "IMPORT_URLS", "CAMPAIGN", campaign_id,
-        new_val=f"Imported:{len(inserted_urls)}, Duplicates:{duplicates_count}"
+        new_val=f"Imported:{len(inserted_urls)}, Duplicates:{duplicates_count}, Invalid:{invalid_count}"
     )
     
     await refresh_campaign_readiness(ObjectId(campaign_id), campaign["status"])
@@ -518,7 +534,7 @@ async def start_campaign(
     campaign_oid = ObjectId(campaign_id)
 
     # Check if there are templates
-    templates = await db.comment_templates.find({"campaign_id": campaign_oid, "status": "ACTIVE"}).to_list(length=100)
+    templates = await db.comment_templates.find({"campaign_id": campaign_oid, "status": "ACTIVE"}).sort("created_at", 1).to_list(length=100)
     if not templates:
         raise HTTPException(
             status_code=400,
@@ -542,7 +558,7 @@ async def start_campaign(
     # Find all URLs that need processing (PENDING ones)
     pending_urls = []
     if not is_monitor:
-        pending_urls = await db.target_urls.find({"campaign_id": campaign_oid, "status": "PENDING"}).to_list(length=1000)
+        pending_urls = await db.target_urls.find({"campaign_id": campaign_oid, "status": "PENDING"}).sort("created_at", 1).to_list(length=1000)
         if not pending_urls:
             # Check if there are paused/pending jobs to resume
             existing_jobs = await db.jobs.find({"campaign_id": campaign_oid, "status": "PENDING"}).to_list(length=1000)
@@ -551,7 +567,7 @@ async def start_campaign(
     else:
         if not get_monitor_page_urls(campaign):
             raise HTTPException(status_code=400, detail="Please add at least one profile/page link to monitor before starting this campaign.")
-        pending_urls = await db.target_urls.find({"campaign_id": campaign_oid, "status": "PENDING"}).to_list(length=1000)
+        pending_urls = await db.target_urls.find({"campaign_id": campaign_oid, "status": "PENDING"}).sort("created_at", 1).to_list(length=1000)
         
     lock_result = await db.campaigns.update_one(
         {
@@ -590,22 +606,19 @@ async def start_campaign(
         if acc_id_str in assigned_counts:
             assigned_counts[acc_id_str] += 1
 
-    # 2. Create jobs by cycling URLs and templates through a full URL x template round.
-    # Example: 2 URLs + 3 templates -> U1/T1, U2/T2, U1/T3, U2/T1, U1/T2, U2/T3.
-    total_job_slots = len(pending_urls) * len(templates)
-    for i in range(total_job_slots):
-        target_url = pending_urls[i % len(pending_urls)]
-        template = templates[i % len(templates)]
-
-        # Check if this URL already has an active/queued job
+    # 2. Create one job per URL, advancing comment templates sequentially across runs.
+    template_cursor = int(campaign.get("comment_template_cursor") or 0) % len(templates)
+    created_job_count = 0
+    for target_url in pending_urls:
         existing_job = await db.jobs.find_one({
             "campaign_id": campaign_oid,
             "url_id": target_url["_id"],
-            "template_id": template["_id"],
             "status": {"$in": ["QUEUED", "RUNNING", "PENDING", "RETRYING", "SUCCESS"]}
         })
         if existing_job:
             continue
+
+        template = templates[(template_cursor + created_job_count) % len(templates)]
 
         # Use assigned account if set, otherwise load-balance among accounts
         assigned_id = target_url.get("assigned_account_id")
@@ -640,6 +653,13 @@ async def start_campaign(
         # Enqueue to Redis
         await queue_service.enqueue_job(job_id_str)
         jobs_to_enqueue.append(job_id_str)
+        created_job_count += 1
+
+    if created_job_count:
+        await db.campaigns.update_one(
+            {"_id": campaign_oid},
+            {"$set": {"comment_template_cursor": (template_cursor + created_job_count) % len(templates)}}
+        )
         
     await write_audit_log(
         current_user["id"], current_user["username"],
@@ -756,6 +776,7 @@ async def duplicate_campaign(
         "last_monitored_at": None,
         "repeat_enabled": campaign.get("repeat_enabled", False),
         "repeat_interval_minutes": campaign.get("repeat_interval_minutes"),
+        "comment_template_cursor": 0,
         "next_run_at": None,
         "last_repeat_run_at": None,
         "created_by": current_user["username"],

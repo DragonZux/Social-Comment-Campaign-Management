@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
@@ -11,7 +11,11 @@ def serialize_doc(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if key == "_id":
             new_doc["id"] = str(value)
         elif isinstance(value, datetime):
-            new_doc[key] = value.isoformat()
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            else:
+                value = value.astimezone(timezone.utc)
+            new_doc[key] = value.isoformat().replace("+00:00", "Z")
         elif isinstance(value, dict):
             new_doc[key] = serialize_doc(value)
         elif isinstance(value, list):

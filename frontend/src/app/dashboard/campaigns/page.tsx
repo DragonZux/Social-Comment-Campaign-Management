@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useState, useEffect, useRef } from "react";
 
@@ -11,10 +11,56 @@ const collectStrings = (value) => {
   return [];
 };
 
-const uniqueList = (items) => Array.from(new Set(items));
+const uniqueList = (items: string[]): string[] => Array.from(new Set(items));
+
+const formatVietnamDateTime = (value) => {
+  if (!value) return "";
+  return new Date(value).toLocaleString("vi-VN", {
+    timeZone: "Asia/Ho_Chi_Minh",
+    hour12: false,
+  });
+};
+
+const extractMonitorPageUrlsFromText = (value, platform) => {
+  const raw = (value || "").trim();
+  if (!raw) return [];
+
+  let source = raw;
+  try {
+    source = collectStrings(JSON.parse(raw)).join("\n");
+  } catch (err) {
+    source = raw;
+  }
+
+  const urlMatches = source.match(/(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|threads\.net|threads\.com)\/[^\s"'<>]+/gi) || [];
+  const normalized = urlMatches
+    .map((url) => url.replace(/[),.;\]]+$/, ""))
+    .map((url) => (url.startsWith("http") ? url : `https://${url}`))
+    .map((url) => {
+      try {
+        const parsed = new URL(url);
+        const host = parsed.hostname.replace(/^www\./i, "").toLowerCase();
+        const firstSegment = parsed.pathname.split("/").filter(Boolean)[0] || "";
+        const username = firstSegment.replace(/^@/, "");
+        if (!username) return "";
+        if ((host === "x.com" || host === "twitter.com") && platform === "X") {
+          return `https://x.com/${username}`;
+        }
+        if ((host === "threads.net" || host === "threads.com") && platform === "Threads") {
+          return `https://www.threads.net/@${username}`;
+        }
+      } catch (err) {
+        return "";
+      }
+      return "";
+    })
+    .filter(Boolean);
+
+  return uniqueList(normalized);
+};
 
 const extractUrlsFromText = (value, platform) => {
-  const raw = value.trim();
+  const raw = (value || "").trim();
   if (!raw) return [];
 
   let source = raw;
@@ -41,7 +87,7 @@ const extractUrlsFromText = (value, platform) => {
 };
 
 const parseCommentTemplates = (value) => {
-  const raw = value.trim();
+  const raw = (value || "").trim();
   if (!raw) return [];
 
   try {
@@ -79,17 +125,28 @@ export default function Campaigns() {
   const [newCampaignType, setNewCampaignType] = useState("STATIC");
   const [newMonitorPageUrl, setNewMonitorPageUrl] = useState("");
   const [newMonitorInterval, setNewMonitorInterval] = useState(15);
+  const [newRepeatEnabled, setNewRepeatEnabled] = useState(false);
+  const [newRepeatInterval, setNewRepeatInterval] = useState(60);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [bulkUrls, setBulkUrls] = useState("");
   const [bulkTemplates, setBulkTemplates] = useState("");
 
   const [toasts, setToasts] = useState([]);
-  const timerRef = useRef(null);
+  const selectedCampaignIdRef = useRef(null);
   const parsedBulkUrls = extractUrlsFromText(bulkUrls, selectedCampaign?.platform);
   const parsedBulkTemplates = parseCommentTemplates(bulkTemplates);
+  const parsedNewMonitorPageUrls = extractMonitorPageUrlsFromText(newMonitorPageUrl, newCampaignPlatform);
+  const selectedMonitorPageUrls = selectedCampaign
+    ? extractMonitorPageUrlsFromText(
+        (selectedCampaign.monitor_page_urls && selectedCampaign.monitor_page_urls.length > 0)
+          ? selectedCampaign.monitor_page_urls.join("\n")
+          : selectedCampaign.monitor_page_url || "",
+        selectedCampaign.platform
+      )
+    : [];
 
   const showToast = (message, type = "success") => {
-    const id = Date.now();
+    const id = `${Date.now()}-${Math.random()}`;
     setToasts((prev) => [...prev, { id, message, type }]);
     setTimeout(() => {
       setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -130,17 +187,27 @@ export default function Campaigns() {
   };
 
   const loadDetails = async (campaign) => {
+    selectedCampaignIdRef.current = campaign.id;
     try {
       const updated = await apiFetch(`/api/campaigns/${campaign.id}`);
+      if (selectedCampaignIdRef.current !== campaign.id) return;
       setSelectedCampaign(updated);
+      
       const urls = await apiFetch(`/api/campaigns/${campaign.id}/urls`);
+      if (selectedCampaignIdRef.current !== campaign.id) return;
       setCampaignUrls(urls);
+      
       const tpls = await apiFetch(`/api/campaigns/${campaign.id}/templates`);
+      if (selectedCampaignIdRef.current !== campaign.id) return;
       setCampaignTemplates(tpls);
+      
       const jobs = await apiFetch(`/api/jobs?campaign_id=${campaign.id}`);
+      if (selectedCampaignIdRef.current !== campaign.id) return;
       setCampaignJobs(jobs);
+      
       // Load accounts for the campaign's platform
       const accs = await apiFetch(`/api/accounts?platform=${updated.platform}`);
+      if (selectedCampaignIdRef.current !== campaign.id) return;
       setPlatformAccounts(accs);
     } catch (err) {
       console.warn(err);
@@ -154,31 +221,45 @@ export default function Campaigns() {
   // Poll selected campaign details to show real-time URL and Job updates
   useEffect(() => {
     if (!selectedCampaign) return;
+    const campaignId = selectedCampaign.id;
+    let active = true;
     
     const refreshData = async () => {
       try {
-        const updated = await apiFetch(`/api/campaigns/${selectedCampaign.id}`);
+        const updated = await apiFetch(`/api/campaigns/${campaignId}`);
+        if (!active) return;
         setSelectedCampaign(updated);
-        const urls = await apiFetch(`/api/campaigns/${selectedCampaign.id}/urls`);
+        
+        const urls = await apiFetch(`/api/campaigns/${campaignId}/urls`);
+        if (!active) return;
         setCampaignUrls(urls);
-        const tpls = await apiFetch(`/api/campaigns/${selectedCampaign.id}/templates`);
+        
+        const tpls = await apiFetch(`/api/campaigns/${campaignId}/templates`);
+        if (!active) return;
         setCampaignTemplates(tpls);
-        const jobs = await apiFetch(`/api/jobs?campaign_id=${selectedCampaign.id}`);
+        
+        const jobs = await apiFetch(`/api/jobs?campaign_id=${campaignId}`);
+        if (!active) return;
         setCampaignJobs(jobs);
       } catch (err) {
         console.warn("Poll details error:", err);
       }
     };
 
-    timerRef.current = setInterval(refreshData, 3000);
+    const timer = setInterval(refreshData, 3000);
     return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
+      active = false;
+      clearInterval(timer);
     };
-  }, [selectedCampaign]);
+  }, [selectedCampaign?.id]);
 
   const handleCreate = async (e) => {
     e.preventDefault();
     try {
+      if (newCampaignType === "MONITOR" && parsedNewMonitorPageUrls.length === 0) {
+        showToast("Vui lòng nhập ít nhất một link profile/page hợp lệ để giám sát.", "error");
+        return;
+      }
       const res = await apiFetch("/api/campaigns", {
         method: "POST",
         body: JSON.stringify({
@@ -186,8 +267,11 @@ export default function Campaigns() {
           platform: newCampaignPlatform,
           description: newCampaignDesc,
           campaign_type: newCampaignType,
-          monitor_page_url: newCampaignType === "MONITOR" ? newMonitorPageUrl : null,
+          monitor_page_url: newCampaignType === "MONITOR" ? parsedNewMonitorPageUrls[0] : null,
+          monitor_page_urls: newCampaignType === "MONITOR" ? parsedNewMonitorPageUrls : [],
           monitor_interval: newCampaignType === "MONITOR" ? newMonitorInterval : null,
+          repeat_enabled: newCampaignType === "STATIC" ? newRepeatEnabled : false,
+          repeat_interval_minutes: newCampaignType === "STATIC" && newRepeatEnabled ? newRepeatInterval : null,
         })
       });
       showToast("Tạo chiến dịch thành công!");
@@ -196,6 +280,8 @@ export default function Campaigns() {
       setNewCampaignType("STATIC");
       setNewMonitorPageUrl("");
       setNewMonitorInterval(15);
+      setNewRepeatEnabled(false);
+      setNewRepeatInterval(60);
       setShowCreateModal(false);
       loadCampaigns();
       setSelectedCampaign(res);
@@ -249,12 +335,16 @@ export default function Campaigns() {
       showToast("Vui lòng nhập ít nhất một link bài viết trước khi chạy chiến dịch.", "error");
       return;
     }
+    if (selectedCampaign?.campaign_type === "MONITOR" && selectedMonitorPageUrls.length === 0) {
+      showToast("Vui lòng nhập ít nhất một link profile/page cần giám sát trước khi chạy chiến dịch.", "error");
+      return;
+    }
     if (campaignTemplates.length === 0) {
       showToast("Vui lòng nhập ít nhất một nội dung comment trước khi chạy chiến dịch.", "error");
       return;
     }
     try {
-      const res = await apiFetch(`/api/campaigns/${cid}/start`, { method: "POST" });
+      await apiFetch(`/api/campaigns/${cid}/start`, { method: "POST" });
       showToast("Đã kích hoạt chạy chiến dịch thành công!");
       loadDetails(selectedCampaign);
     } catch (err) {
@@ -264,7 +354,7 @@ export default function Campaigns() {
 
   const pauseCampaign = async (cid) => {
     try {
-      const res = await apiFetch(`/api/campaigns/${cid}/pause`, { method: "POST" });
+      await apiFetch(`/api/campaigns/${cid}/pause`, { method: "POST" });
       showToast("Đã tạm dừng chiến dịch.", "warning");
       loadDetails(selectedCampaign);
     } catch (err) {
@@ -274,7 +364,7 @@ export default function Campaigns() {
 
   const stopCampaign = async (cid) => {
     try {
-      const res = await apiFetch(`/api/campaigns/${cid}/stop`, { method: "POST" });
+      await apiFetch(`/api/campaigns/${cid}/stop`, { method: "POST" });
       showToast("Đã dừng và hoàn tất chiến dịch.", "error");
       loadDetails(selectedCampaign);
     } catch (err) {
@@ -309,7 +399,7 @@ export default function Campaigns() {
 
   const retryAllFailed = async (cid) => {
     try {
-      const res = await apiFetch(`/api/jobs/retry-failed-campaign/${cid}`, { method: "POST" });
+      await apiFetch(`/api/jobs/retry-failed-campaign/${cid}`, { method: "POST" });
       showToast("Đã gửi yêu cầu chạy lại toàn bộ tác vụ thất bại!");
       loadDetails(selectedCampaign);
     } catch (err) {
@@ -367,12 +457,38 @@ export default function Campaigns() {
     return s || "Chưa tạo job";
   };
 
-  const getJobForUrl = (url) => {
-    return campaignJobs.find((job) => job.url_id === url.id || job.target_url === url.url);
+  const getJobsForUrl = (url) => {
+    return campaignJobs
+      .filter((job) => job.url_id === url.id || job.target_url === url.url)
+      .sort((a, b) => new Date(a.scheduled_time || a.completed_at || 0).getTime() - new Date(b.scheduled_time || b.completed_at || 0).getTime());
+  };
+
+  const getStatusForUrlJobs = (jobs, urlStatus) => {
+    if (jobs.length === 0) return urlStatus;
+    if (jobs.some((job) => job.status === "RUNNING")) return "RUNNING";
+    if (jobs.some((job) => job.status === "QUEUED")) return "QUEUED";
+    if (jobs.some((job) => job.status === "RETRYING")) return "RETRYING";
+    if (jobs.some((job) => job.status === "FAILED")) return "FAILED";
+    if (jobs.every((job) => job.status === "SUCCESS")) return "SUCCESS";
+    return jobs[jobs.length - 1]?.status || urlStatus;
+  };
+
+  const updateRepeatSchedule = async (payload) => {
+    try {
+      await apiFetch(`/api/campaigns/${selectedCampaign.id}`, {
+        method: "PATCH",
+        body: JSON.stringify(payload)
+      });
+      showToast("Cập nhật lịch chạy lặp lại thành công!");
+      const updated = await apiFetch(`/api/campaigns/${selectedCampaign.id}`);
+      setSelectedCampaign(updated);
+    } catch (err: any) {
+      showToast(err.message, "error");
+    }
   };
 
   return (
-    <div className="h-full grid grid-cols-1 lg:grid-cols-3 gap-6 items-start pb-8 animate-slide-in">
+    <div className="h-full grid grid-cols-1 lg:grid-cols-[260px_minmax(0,1fr)] gap-4 items-start pb-8 animate-slide-in">
       
       {/* Toast notifications handler */}
       <div className="fixed top-6 right-6 z-50 space-y-3">
@@ -393,14 +509,14 @@ export default function Campaigns() {
       </div>
 
       {/* Left Col: Folders list */}
-      <div className="lg:col-span-1 space-y-4">
-        <div className="flex justify-between items-center pr-1 pl-1">
-          <h3 className="text-sm font-extrabold text-gray-900 uppercase tracking-wider">Danh mục chiến dịch</h3>
+      <div className="space-y-3 min-w-0">
+        <div className="flex justify-between items-center gap-2 pr-1 pl-1">
+          <h3 className="text-xs font-extrabold text-gray-900 uppercase tracking-wider leading-tight">Danh mục chiến dịch</h3>
           <button
             onClick={() => setShowCreateModal(true)}
-            className="h-11 bg-[#3B82F6] hover:bg-blue-600 text-white font-extrabold px-4 rounded-md text-xs transition-all duration-200 hover:scale-105 cursor-pointer shadow-none"
+            className="h-9 bg-[#3B82F6] hover:bg-blue-600 text-white font-extrabold px-3 rounded-md text-[10px] transition-all duration-200 hover:scale-105 cursor-pointer shadow-none shrink-0"
           >
-            + Tạo chiến dịch mới
+            + Tạo mới
           </button>
         </div>
 
@@ -409,19 +525,19 @@ export default function Campaigns() {
             Chưa có chiến dịch nào được tạo. Chọn nút bên trên để khởi tạo một chiến dịch.
           </div>
         ) : (
-          <div className="space-y-3 max-h-[calc(100vh-220px)] overflow-y-auto pr-1">
+          <div className="space-y-2 max-h-[calc(100vh-205px)] overflow-y-auto pr-1">
             {campaigns.map((camp) => (
               <button
                 key={camp.id}
                 onClick={() => loadDetails(camp)}
-                className={`w-full text-left p-5 rounded-lg border transition-all duration-200 cursor-pointer shadow-none ${
+                className={`w-full text-left p-3 rounded-md border transition-all duration-200 cursor-pointer shadow-none ${
                   selectedCampaign?.id === camp.id
                     ? "bg-white border-[#3B82F6]/50 hover:bg-gray-50/50"
                     : "bg-gray-50 border-gray-200 hover:bg-gray-100/80"
                 }`}
               >
-                <div className="flex justify-between items-center">
-                  <span className="font-extrabold text-gray-900 text-sm leading-none">{camp.name}</span>
+                <div className="flex justify-between items-start gap-2">
+                  <span className="min-w-0 truncate font-extrabold text-gray-900 text-xs leading-5">{camp.name}</span>
                   <span className={`px-2 py-0.5 rounded text-[10px] font-extrabold uppercase ${
                     camp.status === "RUNNING"
                       ? "bg-blue-50 text-blue-700 border border-blue-200"
@@ -438,10 +554,10 @@ export default function Campaigns() {
                     {getStatusText(camp.status)}
                   </span>
                 </div>
-                <p className="text-gray-500 text-xs font-semibold mt-2.5 truncate">{camp.description || "Không có mô tả chiến dịch."}</p>
-                <div className="flex justify-between items-center text-[9px] text-gray-400 font-extrabold mt-4 pt-3 border-t border-gray-200 uppercase tracking-widest">
-                  <span>Mạng xã hội: {camp.platform}</span>
-                  <span>Tạo bởi: @{camp.created_by}</span>
+                <p className="text-gray-500 text-[11px] font-semibold mt-1.5 truncate">{camp.description || "Không có mô tả chiến dịch."}</p>
+                <div className="flex justify-between items-center gap-2 text-[8px] text-gray-400 font-extrabold mt-2.5 pt-2 border-t border-gray-200 uppercase tracking-widest">
+                  <span className="truncate">{camp.platform}</span>
+                  <span className="truncate">@{camp.created_by}</span>
                 </div>
               </button>
             ))}
@@ -450,7 +566,7 @@ export default function Campaigns() {
       </div>
 
       {/* Right Col: Details View */}
-      <div className="lg:col-span-2">
+      <div className="min-w-0">
         {selectedCampaign ? (
           <div className="bg-gray-50 border border-gray-200 rounded-lg p-6 space-y-6 shadow-none">
             
@@ -590,23 +706,63 @@ export default function Campaigns() {
                       </select>
                     </div>
                   )}
+
+                  {selectedCampaign.campaign_type !== "MONITOR" && (
+                    <div>
+                      <label className="block mb-1.5 ml-0.5 text-gray-500">Lịch chạy lặp lại</label>
+                      <select
+                        value={selectedCampaign.repeat_enabled ? String(selectedCampaign.repeat_interval_minutes || 60) : "off"}
+                        onChange={(e) => {
+                          if (e.target.value === "off") {
+                            updateRepeatSchedule({ repeat_enabled: false });
+                            return;
+                          }
+                          updateRepeatSchedule({
+                            repeat_enabled: true,
+                            repeat_interval_minutes: Number(e.target.value)
+                          });
+                        }}
+                        className="w-full h-10 bg-gray-55 border border-gray-200 rounded px-3 text-xs font-bold text-gray-900 focus:bg-white focus:outline-none cursor-pointer"
+                      >
+                        <option value="off">Không tự chạy lại</option>
+                        <option value={5}>Mỗi 5 phút</option>
+                        <option value={15}>Mỗi 15 phút</option>
+                        <option value={30}>Mỗi 30 phút</option>
+                        <option value={60}>Mỗi 1 giờ</option>
+                        <option value={360}>Mỗi 6 giờ</option>
+                        <option value={1440}>Mỗi ngày</option>
+                      </select>
+                      {selectedCampaign.repeat_enabled && (
+                        <p className="mt-1.5 text-[10px] font-bold text-gray-400">
+                          Lần chạy kế tiếp: {selectedCampaign.next_run_at ? formatVietnamDateTime(selectedCampaign.next_run_at) : "sau khi vòng hiện tại hoàn tất"}
+                        </p>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 {selectedCampaign.campaign_type === "MONITOR" && (
                   <div>
                     <label className="block mb-1.5 ml-0.5 text-gray-500">Link trang cần giám sát</label>
-                    <input
+                    <textarea
                       key={selectedCampaign.id}
-                      type="url"
                       placeholder={selectedCampaign.platform === "X" ? "Ví dụ: https://x.com/elonmusk" : "Ví dụ: https://www.threads.net/@zuck"}
-                      defaultValue={selectedCampaign.monitor_page_url || ""}
+                      defaultValue={selectedMonitorPageUrls.join("\n")}
+                      rows={4}
                       onBlur={async (e) => {
-                        const newUrl = e.target.value.trim();
-                        if (newUrl === (selectedCampaign.monitor_page_url || "")) return;
+                        const urls = extractMonitorPageUrlsFromText(e.target.value, selectedCampaign.platform);
+                        if (urls.join("\n") === selectedMonitorPageUrls.join("\n")) return;
+                        if (urls.length === 0) {
+                          showToast("Vui lòng nhập ít nhất một link profile/page hợp lệ để giám sát.", "error");
+                          return;
+                        }
                         try {
                           await apiFetch(`/api/campaigns/${selectedCampaign.id}`, {
                             method: "PATCH",
-                            body: JSON.stringify({ monitor_page_url: newUrl })
+                            body: JSON.stringify({
+                              monitor_page_url: urls[0] || null,
+                              monitor_page_urls: urls,
+                            })
                           });
                           showToast("Cập nhật link trang giám sát thành công!");
                           const updated = await apiFetch(`/api/campaigns/${selectedCampaign.id}`);
@@ -615,14 +771,9 @@ export default function Campaigns() {
                           showToast(err.message, "error");
                         }
                       }}
-                      onKeyDown={async (e) => {
-                        if (e.key === "Enter") {
-                          e.preventDefault();
-                          (e.target as HTMLInputElement).blur();
-                        }
-                      }}
-                      className="w-full h-10 bg-gray-55 border border-gray-200 rounded px-3 text-xs font-semibold text-gray-900 focus:bg-white focus:outline-none"
+                      className="w-full bg-gray-55 border border-gray-200 rounded px-3 py-2 text-xs font-semibold text-gray-900 focus:bg-white focus:outline-none resize-none"
                     />
+                    <p className="mt-1.5 text-[10px] font-bold text-gray-400">Mỗi dòng một profile/page link. Đã nhận {selectedMonitorPageUrls.length} link giám sát.</p>
                   </div>
                 )}
               </div>
@@ -631,14 +782,55 @@ export default function Campaigns() {
                 <div className="bg-white border border-gray-200 p-5 rounded-md text-xs font-bold text-gray-600 space-y-2 shadow-none">
                   <h4 className="text-xs font-extrabold uppercase tracking-widest text-gray-500 border-b pb-2">Thông tin giám sát trang</h4>
                   <p className="text-gray-700">Loại chiến dịch: <span className="text-gray-900 font-extrabold">Tự động (Giám sát trang)</span></p>
-                  <p className="text-gray-700">Trang giám sát: <a href={selectedCampaign.monitor_page_url} target="_blank" rel="noopener noreferrer" className="text-[#3B82F6] hover:underline font-mono">{selectedCampaign.monitor_page_url}</a></p>
+                  <div className="text-gray-700">
+                    <p>Trang giám sát: <span className="text-gray-900 font-extrabold">{selectedMonitorPageUrls.length} link</span></p>
+                    <div className="mt-1 space-y-1">
+                      {selectedMonitorPageUrls.map((url) => (
+                        <a key={url} href={url} target="_blank" rel="noopener noreferrer" className="block truncate text-[#3B82F6] hover:underline font-mono">{url}</a>
+                      ))}
+                    </div>
+                  </div>
                   <p className="text-gray-700">Tần suất kiểm tra: <span className="text-gray-900 font-extrabold">{selectedCampaign.monitor_interval} phút</span></p>
                   {selectedCampaign.last_monitored_at && (
-                    <p className="text-gray-400 text-[10px]">Lần quét gần nhất: {new Date(selectedCampaign.last_monitored_at).toLocaleString("vi-VN")}</p>
+                    <p className="text-gray-400 text-[10px]">Lần quét gần nhất: {formatVietnamDateTime(selectedCampaign.last_monitored_at)}</p>
                   )}
                 </div>
               )
             )}
+
+            {selectedCampaign.campaign_type !== "MONITOR" &&
+              !["DRAFT", "READY", "PAUSED"].includes(selectedCampaign.status) && (
+                <div className="bg-white border border-gray-200 p-5 rounded-md text-xs font-bold text-gray-600 space-y-3 shadow-none">
+                  <h4 className="text-xs font-extrabold uppercase tracking-widest text-gray-500 border-b pb-2">Lịch chạy lặp lại</h4>
+                  <select
+                    value={selectedCampaign.repeat_enabled ? String(selectedCampaign.repeat_interval_minutes || 60) : "off"}
+                    onChange={(e) => {
+                      if (e.target.value === "off") {
+                        updateRepeatSchedule({ repeat_enabled: false });
+                        return;
+                      }
+                      updateRepeatSchedule({
+                        repeat_enabled: true,
+                        repeat_interval_minutes: Number(e.target.value)
+                      });
+                    }}
+                    className="w-full h-10 bg-gray-55 border border-gray-200 rounded px-3 text-xs font-bold text-gray-900 focus:bg-white focus:outline-none cursor-pointer"
+                  >
+                    <option value="off">Không tự chạy lại</option>
+                    <option value={5}>Mỗi 5 phút</option>
+                    <option value={15}>Mỗi 15 phút</option>
+                    <option value={30}>Mỗi 30 phút</option>
+                    <option value={60}>Mỗi 1 giờ</option>
+                    <option value={360}>Mỗi 6 giờ</option>
+                    <option value={1440}>Mỗi ngày</option>
+                  </select>
+                  {selectedCampaign.repeat_enabled && (
+                    <p className="text-[10px] font-bold text-gray-400">
+                      Lần chạy kế tiếp: {selectedCampaign.next_run_at ? formatVietnamDateTime(selectedCampaign.next_run_at) : "sau khi vòng hiện tại hoàn tất"}
+                    </p>
+                  )}
+                </div>
+              )}
 
             {/* Split Section: Imports */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -710,8 +902,10 @@ export default function Campaigns() {
                       )}
 
                       {campaignUrls.map((url) => {
-                        const job = getJobForUrl(url);
-                        const status = job?.status || url.status;
+                        const jobsForUrl = getJobsForUrl(url);
+                        const job = jobsForUrl[jobsForUrl.length - 1];
+                        const successJobs = jobsForUrl.filter((item) => item.status === "SUCCESS");
+                        const status = getStatusForUrlJobs(jobsForUrl, url.status);
                         const isEditable = selectedCampaign.status === "DRAFT" || selectedCampaign.status === "READY" || selectedCampaign.status === "PAUSED";
                         const accountLabel = job?.account_username 
                           ? `@${job.account_username}` 
@@ -749,6 +943,11 @@ export default function Campaigns() {
                             </div>
 
                             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-gray-200 pt-2 text-[10px]">
+                              {url.monitor_source_url && (
+                                <span className="w-full truncate font-bold text-gray-500">
+                                  Nguồn giám sát: <a href={url.monitor_source_url} target="_blank" rel="noopener noreferrer" className="text-[#3B82F6] hover:underline font-mono">{url.monitor_source_url}</a>
+                                </span>
+                              )}
                               {isEditable && platformAccounts.length > 0 ? (
                                 <div className="flex items-center gap-1.5">
                                   <span className="font-extrabold text-gray-700 whitespace-nowrap">Người xử lý:</span>
@@ -781,18 +980,29 @@ export default function Campaigns() {
                               )}
                               {job ? (
                                 <span className="font-bold text-gray-500">
-                                  Thử {job.attempt_count}/3
+                                  Tác vụ {successJobs.length}/{jobsForUrl.length} - Thử {job.attempt_count}/3
                                 </span>
                               ) : (
                                 <span className="font-bold text-gray-400">Job sẽ tạo khi chạy campaign</span>
                               )}
                             </div>
 
-                            {job?.error_message && (
-                              <p className="text-[10px] font-mono text-red-600 truncate" title={job.error_message}>
-                                Lỗi: {job.error_message}
-                              </p>
+                            {successJobs.length > 0 && (
+                              <div className="mt-1.5 bg-white border border-gray-100 rounded p-2 text-gray-700 font-semibold shadow-none text-[10px] space-y-1">
+                                <span className="font-extrabold text-gray-400 block text-[9px] uppercase tracking-wider mb-0.5">Nội dung đã comment:</span>
+                                {successJobs.map((item, index) => (
+                                  <div key={item.id || `${url.id}-${index}`} className="truncate" title={item.commented_text || item.template_content || ""}>
+                                    {index + 1}. "{item.commented_text || item.template_content}"
+                                  </div>
+                                ))}
+                              </div>
                             )}
+
+                            {jobsForUrl.filter((item) => item.error_message).map((item, index) => (
+                              <p key={`${item.id || url.id}-err-${index}`} className="text-[10px] font-mono text-red-600 truncate mt-1" title={item.error_message}>
+                                Lỗi: {item.error_message}
+                              </p>
+                            ))}
                           </div>
                         );
                       })}
@@ -930,15 +1140,20 @@ export default function Campaigns() {
               {newCampaignType === "MONITOR" && (
                 <>
                   <div>
-                    <label className="block mb-1.5 ml-0.5">Link trang cần giám sát (Profile/Page Link)</label>
-                    <input
-                      type="url"
+                    <label className="block mb-1.5 ml-0.5">Link trang cần giám sát (Profile/Page Links)</label>
+                    <textarea
                       value={newMonitorPageUrl}
                       onChange={(e) => setNewMonitorPageUrl(e.target.value)}
-                      placeholder={newCampaignPlatform === "X" ? "Ví dụ: https://x.com/elonmusk" : "Ví dụ: https://www.threads.net/@zuck"}
-                      className="w-full h-11 bg-gray-100 border border-gray-200 rounded-md px-4 text-xs font-semibold text-gray-900 focus:bg-white focus:border-2 focus:border-[#3B82F6] focus:outline-none transition-all"
+                      placeholder={newCampaignPlatform === "X" ? "Mỗi dòng một link, ví dụ:\nhttps://x.com/elonmusk\nhttps://x.com/openai" : "Mỗi dòng một link, ví dụ:\nhttps://www.threads.net/@zuck\nhttps://www.threads.net/@bbc"}
+                      rows={4}
+                      className="w-full bg-gray-100 border border-gray-200 rounded-md p-3.5 text-xs font-semibold text-gray-900 focus:bg-white focus:border-2 focus:border-[#3B82F6] focus:outline-none transition-all resize-none"
                       required
                     />
+                    {newMonitorPageUrl.trim() && (
+                      <p className={`mt-1.5 text-[10px] font-bold ${parsedNewMonitorPageUrls.length > 0 ? "text-emerald-600" : "text-amber-600"}`}>
+                        Đã nhận {parsedNewMonitorPageUrls.length} link giám sát hợp lệ cho {newCampaignPlatform}.
+                      </p>
+                    )}
                   </div>
                   <div>
                     <label className="block mb-1.5 ml-0.5">Tần suất kiểm tra</label>
@@ -955,6 +1170,34 @@ export default function Campaigns() {
                     </select>
                   </div>
                 </>
+              )}
+
+              {newCampaignType === "STATIC" && (
+                <div className="rounded-md border border-gray-200 bg-gray-50 p-3 space-y-3">
+                  <label className="flex items-center gap-2 text-xs font-extrabold text-gray-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={newRepeatEnabled}
+                      onChange={(e) => setNewRepeatEnabled(e.target.checked)}
+                      className="h-4 w-4 rounded border-gray-300 text-[#3B82F6] cursor-pointer"
+                    />
+                    <span>Tự chạy lại chiến dịch theo chu kỳ</span>
+                  </label>
+                  {newRepeatEnabled && (
+                    <select
+                      value={newRepeatInterval}
+                      onChange={(e) => setNewRepeatInterval(Number(e.target.value))}
+                      className="w-full h-10 bg-white border border-gray-200 rounded-md px-3 text-xs font-bold text-gray-900 focus:border-2 focus:border-[#3B82F6] focus:outline-none transition-all"
+                    >
+                      <option value={5}>Mỗi 5 phút</option>
+                      <option value={15}>Mỗi 15 phút</option>
+                      <option value={30}>Mỗi 30 phút</option>
+                      <option value={60}>Mỗi 1 giờ</option>
+                      <option value={360}>Mỗi 6 giờ</option>
+                      <option value={1440}>Mỗi ngày</option>
+                    </select>
+                  )}
+                </div>
               )}
 
               <div>

@@ -137,6 +137,32 @@ def shortcode_to_id(shortcode: str) -> int:
     return media_id
 
 
+def validate_comment_target_url(platform: str, target_url: str) -> None:
+    """Validate comment target URLs before invoking external social workflows."""
+    if not target_url or not target_url.strip():
+        raise ValueError("Target post URL is required.")
+
+    url = target_url.strip()
+    if platform == "X":
+        if not re.search(r"https?://(?:www\.)?(?:x\.com|twitter\.com)/[^/\s]+/status/\d+", url, re.IGNORECASE):
+            raise ValueError("X URL phai co dang https://x.com/username/status/TWEET_ID.")
+        return
+
+    if platform == "Threads":
+        if not re.search(
+            r"https?://(?:www\.)?threads\.(?:net|com)/(?:@?[A-Za-z0-9_.]+/(?:post|t)/|t/)[A-Za-z0-9_-]+",
+            url,
+            re.IGNORECASE,
+        ):
+            raise ValueError(
+                "Threads URL phai co dang https://www.threads.net/@username/post/POST_ID "
+                "hoac https://www.threads.net/t/POST_ID."
+            )
+        return
+
+    raise ValueError(f"Platform {platform} chua ho tro post comment.")
+
+
 async def post_to_threads_official(
     access_token: str,
     threads_user_id: str,
@@ -1271,6 +1297,7 @@ async def mock_post_comment(
     performs a real HTTP call; otherwise, falls back to simulation.
     """
     logger.info(f"[{platform}] Account @{username} processing comment on {target_url}...")
+    validate_comment_target_url(platform, target_url)
 
     # Determine if we should perform a real HTTP post using cookies
     has_threads_token = (

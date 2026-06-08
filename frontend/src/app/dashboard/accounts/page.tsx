@@ -42,6 +42,27 @@ const extractAccountCookie = (value) => {
 };
 
 
+// Post comment URL helpers
+const getPostUrlHelp = (platform) => (
+  platform === "Threads"
+    ? "Threads URL phai co dang https://www.threads.net/@username/post/POST_ID hoac https://www.threads.net/t/POST_ID"
+    : "X URL phai co dang https://x.com/username/status/TWEET_ID"
+);
+
+const isValidPostTargetUrl = (platform, value) => {
+  const url = value.trim();
+  if (platform === "Threads") {
+    return /^https?:\/\/(?:www\.)?threads\.(?:net|com)\/(?:@?[A-Za-z0-9_.]+\/(?:post|t)\/|t\/)[A-Za-z0-9_-]+/i.test(url);
+  }
+  return /^https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\/[^/\s]+\/status\/\d+/i.test(url);
+};
+
+const getPostUrlPlaceholder = (platform) => (
+  platform === "Threads"
+    ? "https://www.threads.net/@username/post/POST_ID"
+    : "https://x.com/username/status/TWEET_ID"
+);
+
 // Cải thiện parser cookie - xử lý 3 format chính
 const parseCookieMap = (value) => {
   const raw = (value || "").trim();
@@ -721,6 +742,7 @@ export default function Accounts() {
   const [loginScriptProfileUrl, setLoginScriptProfileUrl] = useState("");
   const [showPostModal, setShowPostModal] = useState(false);
   const [postAccountId, setPostAccountId] = useState(null);
+  const [postAccountPlatform, setPostAccountPlatform] = useState("X");
   const [postTargetUrl, setPostTargetUrl] = useState("");
   const [postText, setPostText] = useState("");
   const [postingId, setPostingId] = useState(null);
@@ -1588,7 +1610,7 @@ export default function Accounts() {
 
                     <div className="flex items-center">
                       <button
-                        onClick={() => { setShowPostModal(true); setPostAccountId(acc.id); setPostTargetUrl(''); setPostText(''); }}
+                        onClick={() => { setShowPostModal(true); setPostAccountId(acc.id); setPostAccountPlatform(acc.platform || "X"); setPostTargetUrl(''); setPostText(''); }}
                         className="ml-2 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-600 font-extrabold rounded-md px-3 h-10 transition-all duration-200 hover:scale-[1.02] text-xs"
                       >
                         💬 Post
@@ -2414,7 +2436,8 @@ https://www.threads.net/@lifestyle_vlog sessionid=...
             <div className="space-y-3">
               <div>
                 <label className="block text-xs font-bold text-gray-600 mb-1">Target post URL</label>
-                <input value={postTargetUrl} onChange={(e) => setPostTargetUrl(e.target.value)} placeholder="https://www.threads.net/post/..." className="w-full border border-gray-200 rounded-md p-2 text-sm" />
+                <input value={postTargetUrl} onChange={(e) => setPostTargetUrl(e.target.value)} placeholder={getPostUrlPlaceholder(postAccountPlatform)} className="w-full border border-gray-200 rounded-md p-2 text-sm" />
+                <p className="mt-1 text-[11px] font-semibold text-gray-500">{getPostUrlHelp(postAccountPlatform)}</p>
               </div>
               <div>
                 <label className="block text-xs font-bold text-gray-600 mb-1">Comment text</label>
@@ -2430,6 +2453,7 @@ https://www.threads.net/@lifestyle_vlog sessionid=...
                   onClick={async () => {
                     if (!postAccountId) return;
                     if (!postTargetUrl || !postText) { showToast('Vui lòng nhập URL và nội dung comment.', 'error'); return; }
+                    if (!isValidPostTargetUrl(postAccountPlatform, postTargetUrl)) { showToast(getPostUrlHelp(postAccountPlatform), 'error'); return; }
                     setPostingId(postAccountId);
                     try {
                       const res = await apiFetch(`/api/accounts/${postAccountId}/post-comment`, {

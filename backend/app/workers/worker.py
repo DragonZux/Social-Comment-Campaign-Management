@@ -354,6 +354,44 @@ class Worker:
             }}
         )
 
+    async def refresh_target_url_status_from_jobs(self, url_id):
+        jobs = await self.db.jobs.find({"url_id": url_id}).sort("created_at", -1).to_list(length=1000)
+        if not jobs:
+            return
+
+        active_statuses = ["PENDING", "QUEUED", "RUNNING", "RETRYING"]
+        now = datetime.utcnow()
+        active_job = next((job for job in jobs if job.get("status") in active_statuses), None)
+        latest_job = jobs[0]
+
+        if active_job:
+            next_status = "PROCESSING"
+            processed_at = None
+            error_message = None
+        elif latest_job.get("status") == "FAILED":
+            next_status = "FAILED"
+            processed_at = now
+            error_message = latest_job.get("error_message")
+        elif latest_job.get("status") == "CANCELLED":
+            next_status = "SKIPPED"
+            processed_at = now
+            error_message = latest_job.get("error_message") or "Job was cancelled."
+        elif latest_job.get("status") == "SUCCESS":
+            next_status = "SUCCESS"
+            processed_at = now
+            error_message = None
+        else:
+            return
+
+        await self.db.target_urls.update_one(
+            {"_id": url_id},
+            {"$set": {
+                "status": next_status,
+                "processed_at": processed_at,
+                "error_message": error_message
+            }}
+        )
+
     async def check_campaign_completion(self, campaign_id):
         # Count remaining running/queued/pending jobs in this campaign
         remaining = await self.db.jobs.count_documents({
@@ -542,15 +580,7 @@ class Worker:
                 }}
             )
             
-            # Update target URL to SUCCESS
-            await db.target_urls.update_one(
-                {"_id": url_doc["_id"]},
-                {"$set": {
-                    "status": "SUCCESS",
-                    "processed_at": now,
-                    "error_message": None
-                }}
-            )
+            await self.refresh_target_url_status_from_jobs(url_doc["_id"])
             
             # Update account usage counters and activity time
             await db.accounts.update_one(
@@ -628,7 +658,9 @@ class Worker:
         test_account = valid_accounts[0]
         
         # Fetch templates
-        templates = await db.comment_templates.find({"campaign_id": campaign_id, "status": "ACTIVE"}).to_list(length=100)
+        templates = await db.comment_templates.find(
+            {"campaign_id": campaign_id, "status": "ACTIVE"}
+        ).sort("created_at", 1).to_list(length=100)
         if not templates:
             logger.error(f"Cannot process new posts for campaign '{campaign['name']}': No active comment templates.")
             return
@@ -646,6 +678,7 @@ class Worker:
                 assigned_counts[acc_id_str] += 1
 
         new_targets = []
+        scheduled_url_ids = set()
         for page_index, page_url in enumerate(page_urls):
             source_existing_urls = [
                 doc["url"]
@@ -659,7 +692,7 @@ class Worker:
                     source_existing_urls,
                     cookie_str=test_account.get("cookie"),
                     proxy=test_account.get("proxy"),
-                    allow_real_fallback=True,
+                    allow_real_fallback=False,
                 )
             except Exception as e:
                 logger.warning(f"Cannot fetch latest post for monitored source {page_url}: {e}")
@@ -673,12 +706,20 @@ class Worker:
                 (
                     doc
                     for doc in existing_url_docs
-                    if doc.get("url") == latest_post and doc.get("monitor_source_url") == page_url
+                    if doc.get("url") == latest_post
                 ),
                 None
             )
 
             if url_doc:
+                url_id_str = str(url_doc["_id"])
+                if url_id_str in scheduled_url_ids:
+                    logger.info(
+                        f"Latest post {latest_post} was already scheduled in this monitor cycle. "
+                        f"Skipping duplicate source {page_url}."
+                    )
+                    continue
+
                 active_for_url = await db.jobs.count_documents({
                     "campaign_id": campaign_id,
                     "url_id": url_doc["_id"],
@@ -722,17 +763,16 @@ class Worker:
                 })
 
             new_targets.append(url_doc)
+            scheduled_url_ids.add(str(url_doc["_id"]))
 
         jobs_enqueued = 0
-        total_job_slots = len(new_targets) * len(templates)
-        for i in range(total_job_slots):
-            target_url = new_targets[i % len(new_targets)]
+        template_cursor = int(campaign.get("comment_template_cursor") or 0) % len(templates)
+        for target_url in new_targets:
+            template = templates[(template_cursor + jobs_enqueued) % len(templates)]
 
             # Select account using smart load balancing
             account = min(valid_accounts, key=lambda a: assigned_counts[str(a["_id"])])
             assigned_counts[str(account["_id"])] += 1
-
-            template = templates[i % len(templates)]
 
             job_doc = {
                 "campaign_id": campaign_id,
@@ -752,7 +792,16 @@ class Worker:
 
             await self.redis_client.rpush(IMMEDIATE_QUEUE, job_id_str)
             jobs_enqueued += 1
-            logger.info(f"Enqueued job {job_id_str} for monitored new post: {target_url['url']}")
+            logger.info(
+                f"Enqueued job {job_id_str} for monitored post: {target_url['url']} "
+                f"using template {template['_id']}"
+            )
+
+        if jobs_enqueued:
+            await db.campaigns.update_one(
+                {"_id": campaign_id},
+                {"$set": {"comment_template_cursor": (template_cursor + jobs_enqueued) % len(templates)}}
+            )
 
     async def check_monitored_campaigns(self):
         db = self.db
@@ -824,7 +873,7 @@ class Worker:
         templates = await db.comment_templates.find({
             "campaign_id": campaign_id,
             "status": "ACTIVE",
-        }).to_list(length=100)
+        }).sort("created_at", 1).to_list(length=100)
         if not templates:
             await self.postpone_recurring_campaign(campaign, "No active comment templates configured")
             return
@@ -880,9 +929,9 @@ class Worker:
                 assigned_counts[acc_id_str] += 1
 
         jobs_enqueued = 0
-        total_job_slots = len(target_urls) * len(templates)
-        for i in range(total_job_slots):
-            target_url = target_urls[i % len(target_urls)]
+        template_cursor = int(campaign.get("comment_template_cursor") or 0) % len(templates)
+        for target_url in target_urls:
+            template = templates[(template_cursor + jobs_enqueued) % len(templates)]
             assigned_id = target_url.get("assigned_account_id")
             account = None
             if assigned_id:
@@ -891,7 +940,6 @@ class Worker:
                 account = min(valid_accounts, key=lambda a: assigned_counts[str(a["_id"])])
 
             assigned_counts[str(account["_id"])] += 1
-            template = templates[i % len(templates)]
             job_doc = {
                 "campaign_id": campaign_id,
                 "account_id": account["_id"],
@@ -913,6 +961,12 @@ class Worker:
             )
             await self.redis_client.rpush(IMMEDIATE_QUEUE, job_id_str)
             jobs_enqueued += 1
+
+        if jobs_enqueued:
+            await db.campaigns.update_one(
+                {"_id": campaign_id},
+                {"$set": {"comment_template_cursor": (template_cursor + jobs_enqueued) % len(templates)}}
+            )
 
         logger.info(f"Recurring campaign '{campaign['name']}' started. Enqueued {jobs_enqueued} jobs.")
 

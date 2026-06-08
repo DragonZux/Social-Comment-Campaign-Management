@@ -492,15 +492,54 @@ async def post_to_x_playwright(
             await page.keyboard.insert_text(comment_content)
             await page.wait_for_timeout(1500)
 
-            submit_selectors = (
-                "[data-testid='tweetButton'], [data-testid='tweetButtonInline'], "
-                "div[role='button']:has-text('Reply'), button:has-text('Reply'), "
-                "div[role='button']:has-text('Post'), button:has-text('Post'), "
-                "[aria-label='Reply'], [aria-label='Post']"
-            )
-            submitted = await click_first_visible(scope.locator(submit_selectors), "submit reply")
+            # Try specific X reply submit selectors one-by-one to avoid DOM ordering issues
+            # (e.g. clicking the sidebar 'Post' button instead of the actual inline 'Reply' button)
+            submitted = False
+            for selector in [
+                "[data-testid='tweetButtonInline']",
+                "[data-testid='tweetButton']",
+                "button:has-text('Reply')",
+                "div[role='button']:has-text('Reply')",
+                "[aria-label='Reply']",
+                "button:has-text('Trả lời')",
+                "div[role='button']:has-text('Trả lời')",
+                "[aria-label='Trả lời']"
+            ]:
+                if await click_first_visible(scope.locator(selector), f"submit reply ({selector})"):
+                    submitted = True
+                    break
+
+            # If still not submitted, try generic 'Post' or 'Đăng' buttons but filter out left sidebar navigation buttons
             if not submitted:
-                submitted = await click_first_visible(page.locator(submit_selectors), "submit reply page")
+                for selector in [
+                    "button:has-text('Post')",
+                    "div[role='button']:has-text('Post')",
+                    "button:has-text('Đăng')",
+                    "div[role='button']:has-text('Đăng')"
+                ]:
+                    locator = scope.locator(selector)
+                    count = await locator.count()
+                    for index in range(count):
+                        candidate = locator.nth(index)
+                        try:
+                            if not await candidate.is_visible():
+                                continue
+                            testid = await candidate.get_attribute("data-testid") or ""
+                            if "SideNavigation" in testid or "NewTweet" in testid:
+                                # Skip left sidebar navigation buttons
+                                continue
+                            aria_disabled = await candidate.get_attribute("aria-disabled")
+                            disabled = await candidate.get_attribute("disabled")
+                            if aria_disabled == "true" or disabled is not None:
+                                continue
+                            await candidate.click(timeout=5000)
+                            logger.info(f"Clicked X fallback submit candidate #{index + 1} ({selector})")
+                            submitted = True
+                            break
+                        except Exception as e:
+                            logger.debug(f"Skipping X fallback submit candidate #{index + 1}: {e}")
+                    if submitted:
+                        break
             if not submitted:
                 await page.keyboard.press("Control+Enter")
                 await page.wait_for_timeout(2000)
@@ -649,15 +688,22 @@ async def post_to_threads_playwright(
         return False
 
     async def editor_contains_text(editor, text: str) -> bool:
+        def normalize(t: str) -> str:
+            return re.sub(r'\s+', '', t).lower()
+        
+        normalized_target = normalize(text)
+        if not normalized_target:
+            return True
+
         try:
-            editor_text = (await editor.inner_text()).strip()
-            if text in editor_text:
+            editor_text = await editor.inner_text()
+            if normalized_target in normalize(editor_text):
                 return True
         except Exception:
             pass
         try:
-            editor_value = (await editor.input_value()).strip()
-            if text in editor_value:
+            editor_value = await editor.input_value()
+            if normalized_target in normalize(editor_value):
                 return True
         except Exception:
             pass
@@ -998,23 +1044,34 @@ async def post_to_threads_playwright(
 
             logger.info(f"Entering comment text: {comment_content}")
             try:
+                await editor.focus()
+                await editor.click(timeout=5000)
                 await editor.fill(comment_content)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Failed to fill editor: {e}, falling back to keyboard typing...")
                 try:
-                    await page.keyboard.insert_text(comment_content)
-                except Exception:
-                    await editor.press_sequentially(comment_content, delay=50)
+                    await editor.focus()
+                    await editor.click(force=True, timeout=5000)
+                    await page.keyboard.type(comment_content)
+                except Exception as e2:
+                    logger.warning(f"Keyboard type fallback failed: {e2}, trying press_sequentially...")
+                    await editor.press_sequentially(comment_content, delay=30)
 
             # Wait for the text to be entered and submit button to become active
             await page.wait_for_timeout(1500)
-            text_scope = dialog if dialog_visible else page
             if not await editor_contains_text(editor, comment_content):
+                logger.warning("Editor does not contain the target text. Attempting forced click and keyboard typing...")
                 try:
+                    await editor.focus()
                     await editor.click(force=True, timeout=5000)
-                    await page.keyboard.insert_text(comment_content)
-                    await page.wait_for_timeout(1000)
-                except Exception:
-                    pass
+                    # Clear any partial text first (select all and backspace)
+                    await page.keyboard.press("Control+A")
+                    await page.keyboard.press("Backspace")
+                    await page.wait_for_timeout(300)
+                    await page.keyboard.type(comment_content)
+                    await page.wait_for_timeout(1500)
+                except Exception as e:
+                    logger.warning(f"Forced typing attempt failed: {e}")
 
             if not await editor_contains_text(editor, comment_content):
                 raise RuntimeError("Threads composer did not receive the comment text before submit.")
@@ -1482,6 +1539,12 @@ async def fetch_real_latest_post(platform: str, page_url: str, cookie_str: Optio
                     # Go to profile url
                     await page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
                     await page.wait_for_timeout(5000) # Wait for client rendering
+
+                    # Check redirection (e.g. to login or home feed)
+                    username_lower = username.lower().replace("@", "")
+                    page_url_lower = page.url.lower()
+                    if f"/{username_lower}" not in page_url_lower and f"/@{username_lower}" not in page_url_lower:
+                        raise RuntimeError(f"Bị chuyển hướng khỏi trang cá nhân của @{username} (URL hiện tại: {page.url}). Cookie có thể đã hết hạn.")
 
                     if platform == "X":
                         # Find links containing "/status/"

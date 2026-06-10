@@ -856,6 +856,14 @@ async def post_to_threads_playwright(
         ):
             return True
 
+        # Strategy 1.5: XPath exact text matching on normalized space (case-sensitive and case-insensitive)
+        for word in ["Post", "Đăng", "Gửi", "post", "đăng", "gửi"]:
+            if await click_first_visible(
+                scope.locator(f"xpath=//*[normalize-space(.)='{word}']"),
+                f"exact text '{word}' element",
+            ):
+                return True
+
         # Strategy 2: inline Threads composer uses an icon-only submit control beside the editor
         if editor is not None and await click_near_editor_submit(page, editor):
             return True
@@ -1030,9 +1038,17 @@ async def post_to_threads_playwright(
 
                 # Threads can open a modal dialog or an inline composer under the post.
                 try:
-                    await page.wait_for_selector(f"[role='dialog'], {editor_selector}", timeout=10000)
-                    dialog = page.locator("[role='dialog']").last
-                    dialog_visible = await dialog.count() > 0 and await dialog.is_visible()
+                    # First try to wait for a modal dialog to appear (common case)
+                    try:
+                        await page.wait_for_selector("[role='dialog']", timeout=3000)
+                        dialog = page.locator("[role='dialog']").last
+                        dialog_visible = await dialog.count() > 0 and await dialog.is_visible()
+                    except Exception:
+                        dialog_visible = False
+
+                    if not dialog_visible:
+                        # Fallback: wait for the editor selector (inline case)
+                        await page.wait_for_selector(editor_selector, timeout=7000)
                 except Exception:
                     # Capture debug screenshot
                     try:
@@ -1072,16 +1088,18 @@ async def post_to_threads_playwright(
             try:
                 await editor.focus()
                 await editor.click(timeout=5000)
-                await editor.fill(comment_content)
+                # Clear any existing text first
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Backspace")
+                await page.wait_for_timeout(300)
+                # Type using insert_text to trigger React state updates
+                await page.keyboard.insert_text(comment_content)
             except Exception as e:
-                logger.warning(f"Failed to fill editor: {e}, falling back to keyboard typing...")
+                logger.warning(f"Failed to enter text via keyboard: {e}, trying fallback fill...")
                 try:
-                    await editor.focus()
-                    await editor.click(force=True, timeout=5000)
-                    await page.keyboard.type(comment_content)
+                    await editor.fill(comment_content)
                 except Exception as e2:
-                    logger.warning(f"Keyboard type fallback failed: {e2}, trying press_sequentially...")
-                    await editor.press_sequentially(comment_content, delay=30)
+                    logger.warning(f"Fallback fill failed: {e2}")
 
             # Wait for the text to be entered and submit button to become active
             await page.wait_for_timeout(1500)
@@ -1191,16 +1209,31 @@ async def post_to_threads_playwright(
                     await page.wait_for_timeout(2000)
 
                     try:
+                        # If dialog was visible and now it is not visible/detached, comment was submitted
+                        if dialog_visible:
+                            try:
+                                is_dialog_still_visible = await dialog.is_visible()
+                                if not is_dialog_still_visible:
+                                    post_verified = True
+                                    verification_msg = "Editor hidden after submit (dialog closed)"
+                                    break
+                            except Exception:
+                                post_verified = True
+                                verification_msg = "Editor no longer in DOM (dialog detached)"
+                                break
+
                         editor_visible = await editor.is_visible()
                         if editor_visible:
                             editor_text = (await editor.inner_text()).strip()
-                            if editor_text == "" or editor_text != comment_content:
+                            # If the editor is empty or does not contain our comment content anymore, it is verified.
+                            # Since wrapper elements can contain username/placeholders, we check if our comment text is gone.
+                            if editor_text == "" or comment_content not in editor_text:
                                 post_verified = True
                                 verification_msg = "Editor cleared after submit"
                                 break
                         else:
                             post_verified = True
-                            verification_msg = "Editor hidden after submit (dialog closed)"
+                            verification_msg = "Editor hidden after submit"
                             break
                     except Exception:
                         post_verified = True
@@ -1414,6 +1447,238 @@ async def mock_post_comment(
         "timestamp": asyncio.get_event_loop().time(),
         "transaction_id": f"tx_{platform.lower()}_{random.randint(100000000, 999999999)}"
     }
+
+async def refresh_threads_access_token(
+    access_token: str,
+    proxy: Optional[str] = None,
+) -> dict:
+    """
+    Refreshes a Threads long-lived access token via Meta's Graph API.
+    Returns a dict with the new token and expiry info.
+    """
+    proxies = {
+        "http://": proxy,
+        "https://": proxy
+    } if proxy else None
+
+    async with httpx.AsyncClient(proxies=proxies, timeout=30.0) as client:
+        response = await client.get(
+            "https://graph.threads.net/refresh_access_token",
+            params={
+                "grant_type": "th_refresh_token",
+                "access_token": access_token,
+            },
+        )
+
+    try:
+        data = response.json()
+    except Exception:
+        raise RuntimeError(f"Meta API response is not JSON: {response.text[:200]}")
+
+    if response.status_code >= 400 or "error" in data:
+        error = data.get("error", data)
+        raise RuntimeError(f"Threads token refresh failed: {error}")
+
+    new_token = data.get("access_token")
+    if not new_token:
+        raise RuntimeError(f"No access_token in refresh response: {data}")
+
+    return {
+        "access_token": new_token,
+        "token_type": data.get("token_type", "bearer"),
+        "expires_in": data.get("expires_in", 0),
+    }
+
+
+async def refresh_account_cookies(
+    platform: str,
+    cookie_str: str,
+    username: str = "",
+    proxy: Optional[str] = None,
+) -> dict:
+    """
+    Uses Playwright to inject existing cookies into a headless browser,
+    navigate to the social platform, and extract refreshed cookies.
+    Returns a dict with new_cookie string and details.
+    """
+    from playwright.async_api import async_playwright
+
+    if not cookie_str or len(cookie_str) <= 20:
+        raise ValueError("Cookie quá ngắn hoặc rỗng. Không thể refresh.")
+
+    cookies_dict = parse_cookie_to_dict(cookie_str)
+    if not cookies_dict:
+        raise ValueError("Không phân tích được cookie. Vui lòng kiểm tra định dạng.")
+
+    if platform == "X":
+        required = ["auth_token", "ct0"]
+        missing = [k for k in required if not cookies_dict.get(k)]
+        if missing:
+            raise ValueError(f"Cookie X thiếu trường: {', '.join(missing)}")
+        # Only inject on the primary domain to avoid stale duplicates on secondary domains
+        inject_domains = [".x.com"]
+        # Priority order for extraction: primary domain first, secondary last
+        # Cookies from the primary domain (.x.com) will overwrite secondary (.twitter.com)
+        extract_domain_priority = [".twitter.com", ".x.com"]  # last wins
+        navigate_url = f"https://x.com/{username}" if username else "https://x.com/home"
+    elif platform == "Threads":
+        has_session = cookies_dict.get("sessionid") or cookies_dict.get("session_id")
+        if not has_session:
+            raise ValueError("Cookie Threads thiếu 'sessionid'. Không thể refresh.")
+        # Inject to all domains to ensure full session context (Threads uses instagram.com cookies)
+        inject_domains = [".threads.net", ".threads.com", ".instagram.com"]
+        extract_domain_priority = [".instagram.com", ".threads.com", ".threads.net"]  # last wins
+        navigate_url = f"https://www.threads.net/@{username}" if username else "https://www.threads.net"
+    else:
+        raise ValueError(f"Nền tảng {platform} chưa được hỗ trợ refresh cookie.")
+
+    logger.info(f"[{platform}] Starting cookie refresh for @{username}...")
+
+    async with async_playwright() as p:
+        launch_kwargs = {
+            "headless": True,
+            "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        }
+        if proxy:
+            launch_kwargs["proxy"] = {"server": proxy}
+
+        browser = await p.chromium.launch(**launch_kwargs)
+        try:
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+            )
+
+            # Inject existing cookies ONLY on the primary domain
+            # This avoids stale copies on secondary domains (e.g. .twitter.com)
+            # that could overwrite freshly rotated cookies (e.g. ct0) from the primary domain
+            playwright_cookies = []
+            for name, value in cookies_dict.items():
+                for domain in inject_domains:
+                    playwright_cookies.append({
+                        "name": name,
+                        "value": value,
+                        "domain": domain,
+                        "path": "/",
+                        "secure": True,
+                        "sameSite": "None",
+                    })
+            await context.add_cookies(playwright_cookies)
+
+            # Navigate to the platform
+            page = await context.new_page()
+            logger.info(f"[{platform}] Navigating to {navigate_url} to refresh cookies...")
+            try:
+                await page.goto(navigate_url, wait_until="domcontentloaded", timeout=45000)
+            except Exception:
+                await page.goto(navigate_url, wait_until="load", timeout=45000)
+
+            # Wait for the page to fully load and all cookies to be set
+            await page.wait_for_timeout(3000)
+
+            # Try to trigger additional network requests that may refresh cookies
+            # by scrolling the page slightly
+            try:
+                await page.evaluate("window.scrollBy(0, 300)")
+                await page.wait_for_timeout(2000)
+            except Exception:
+                pass
+
+            # Check if we got redirected to login (cookie expired)
+            current_url = page.url.lower()
+            login_markers = ["login", "signin", "sign_in", "flow/login", "accounts/login"]
+            if any(marker in current_url for marker in login_markers):
+                raise SocialAuthError(
+                    f"Cookie {platform} đã hết hạn. Trang chuyển hướng về đăng nhập. "
+                    "Vui lòng đăng nhập lại thủ công và cập nhật cookie mới."
+                )
+
+            # Check for checkpoint/challenge pages
+            checkpoint_markers = ["checkpoint", "challenge", "captcha", "suspended"]
+            if any(marker in current_url for marker in checkpoint_markers):
+                raise SocialAuthError(
+                    f"Tài khoản {platform} cần xác minh thủ công (checkpoint/challenge). "
+                    "Vui lòng đăng nhập bằng trình duyệt, xác minh, rồi cập nhật cookie mới."
+                )
+
+            # Extract all cookies from the browser context
+            all_browser_cookies = await context.cookies()
+
+            # Build refreshed cookies dict with DOMAIN PRIORITY
+            # Process secondary domains first, then primary domain last
+            # so that primary domain cookies (which are most likely to be freshly updated)
+            # overwrite any stale secondary domain copies
+            all_extract_domains = set(d.lstrip(".") for d in extract_domain_priority)
+            domain_buckets = {d: {} for d in extract_domain_priority}
+
+            for c in all_browser_cookies:
+                cookie_domain = c.get("domain", "").lstrip(".")
+                for d in extract_domain_priority:
+                    if cookie_domain.endswith(d.lstrip(".")):
+                        domain_buckets[d][c["name"]] = c["value"]
+                        break
+
+            # Merge in priority order (last domain in the list wins)
+            refreshed_cookies = {}
+            for domain in extract_domain_priority:
+                refreshed_cookies.update(domain_buckets[domain])
+
+            if not refreshed_cookies:
+                raise RuntimeError(
+                    f"Không lấy được cookie mới từ {platform}. "
+                    "Có thể cookie đã hết hạn hoặc trang không phản hồi."
+                )
+
+            # Build new cookie string in key=value; format
+            new_cookie_str = "; ".join([f"{k}={v}" for k, v in refreshed_cookies.items()])
+
+            # Check key cookies are present
+            if platform == "X":
+                if not refreshed_cookies.get("ct0") or not refreshed_cookies.get("auth_token"):
+                    raise RuntimeError(
+                        "Cookie mới từ X thiếu ct0 hoặc auth_token. "
+                        "Phiên đăng nhập có thể đã hết hạn."
+                    )
+                logger.info(
+                    f"[X] ct0 changed: {cookies_dict.get('ct0', '')[:8]}... -> {refreshed_cookies.get('ct0', '')[:8]}..."
+                )
+            elif platform == "Threads":
+                if not (refreshed_cookies.get("sessionid") or refreshed_cookies.get("session_id")):
+                    raise RuntimeError(
+                        "Cookie mới từ Threads thiếu sessionid. "
+                        "Phiên đăng nhập có thể đã hết hạn."
+                    )
+
+            old_count = len(cookies_dict)
+            new_count = len(refreshed_cookies)
+            changed_keys = [
+                k for k in refreshed_cookies
+                if k in cookies_dict and refreshed_cookies[k] != cookies_dict[k]
+            ]
+            new_keys = [k for k in refreshed_cookies if k not in cookies_dict]
+
+            logger.info(
+                f"[{platform}] Cookie refresh complete for @{username}. "
+                f"Old: {old_count} cookies, New: {new_count} cookies, "
+                f"Changed: {len(changed_keys)} ({', '.join(changed_keys[:5])}), Added: {len(new_keys)}"
+            )
+
+            return {
+                "success": True,
+                "new_cookie": new_cookie_str,
+                "cookie_count": new_count,
+                "changed_keys": changed_keys,
+                "new_keys": new_keys,
+                "old_count": old_count,
+                "message": (
+                    f"Đã refresh thành công {new_count} cookies cho @{username}. "
+                    f"{len(changed_keys)} cookies được cập nhật, {len(new_keys)} cookies mới."
+                ),
+            }
+        finally:
+            await browser.close()
+
 
 async def check_account_connection(
     platform: str,

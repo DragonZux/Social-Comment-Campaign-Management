@@ -6,7 +6,7 @@ from typing import List, Optional
 from app.db.database import get_db
 from app.schemas import (
     CampaignCreate, CampaignUpdate, CampaignOut,
-    TargetURLImport, TargetURLOut, CommentTemplateImport, CommentTemplateOut,
+    TargetURLImport, TargetURLOut, TargetURLUpdate, CommentTemplateImport, CommentTemplateOut, CommentTemplateUpdate,
     AssignAccountToURL,
     serialize_doc, serialize_docs
 )
@@ -152,12 +152,15 @@ async def create_campaign(
     return serialize_doc(campaign_doc)
 
 
-@router.get("", response_model=List[CampaignOut])
+@router.get("")
 async def list_campaigns(
     platform: str = None,
     status: str = None,
+    page: Optional[int] = None,
+    limit: Optional[int] = None,
     current_user: dict = Depends(get_current_user)
 ):
+    import math
     db = get_db()
     query = {}
     query.update(campaign_scope(current_user))
@@ -166,9 +169,21 @@ async def list_campaigns(
     if status:
         query["status"] = status
         
-    cursor = db.campaigns.find(query).sort("created_at", -1)
-    campaigns = await cursor.to_list(length=100)
-    return serialize_docs(campaigns)
+    if page is not None and limit is not None:
+        total = await db.campaigns.count_documents(query)
+        cursor = db.campaigns.find(query).sort("created_at", -1).skip((page - 1) * limit).limit(limit)
+        campaigns = await cursor.to_list(length=limit)
+        return {
+            "items": serialize_docs(campaigns),
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "pages": math.ceil(total / limit) if limit > 0 else 1
+        }
+    else:
+        cursor = db.campaigns.find(query).sort("created_at", -1)
+        campaigns = await cursor.to_list(length=100)
+        return serialize_docs(campaigns)
 
 
 @router.get("/{campaign_id}", response_model=CampaignOut)
@@ -352,6 +367,187 @@ async def list_campaign_urls(
     return serialize_docs(urls)
 
 
+@router.get("/{campaign_id}/urls/{url_id}", response_model=TargetURLOut)
+async def get_campaign_url(
+    campaign_id: str,
+    url_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get a specific target URL"""
+    if not ObjectId.is_valid(url_id):
+        raise HTTPException(status_code=400, detail="Invalid URL ID")
+    
+    db = get_db()
+    await get_campaign_for_user(campaign_id, current_user)
+    
+    pipeline = [
+        {"$match": {"_id": ObjectId(url_id), "campaign_id": ObjectId(campaign_id)}},
+        {"$lookup": {
+            "from": "accounts",
+            "localField": "assigned_account_id",
+            "foreignField": "_id",
+            "as": "assigned_account"
+        }},
+        {"$unwind": {"path": "$assigned_account", "preserveNullAndEmptyArrays": True}},
+        {"$addFields": {
+            "assigned_account_username": "$assigned_account.username"
+        }},
+        {"$project": {"assigned_account": 0}}
+    ]
+    cursor = db.target_urls.aggregate(pipeline)
+    results = await cursor.to_list(length=1)
+    
+    if not results:
+        raise HTTPException(status_code=404, detail="URL not found")
+    
+    return serialize_doc(results[0])
+
+
+@router.patch("/{campaign_id}/urls/{url_id}", response_model=TargetURLOut)
+async def update_url(
+    campaign_id: str,
+    url_id: str,
+    url_update: TargetURLUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Update a target URL"""
+    if not ObjectId.is_valid(url_id):
+        raise HTTPException(status_code=400, detail="Invalid URL ID")
+    
+    db = get_db()
+    campaign = await get_campaign_for_user(campaign_id, current_user)
+    
+    url_doc = await db.target_urls.find_one({
+        "_id": ObjectId(url_id),
+        "campaign_id": ObjectId(campaign_id)
+    })
+    
+    if not url_doc:
+        raise HTTPException(status_code=404, detail="URL not found")
+    
+    update_data = {}
+    if url_update.url is not None:
+        new_url = url_update.url.strip()
+        # Normalize Threads URL
+        if new_url.lower().startswith("https://threads.com/"):
+            new_url = "https://www.threads.com/" + new_url[len("https://threads.com/"):]
+        elif new_url.lower().startswith("https://threads.net/"):
+            new_url = "https://www.threads.net/" + new_url[len("https://threads.net/"):]
+        
+        # Validate URL
+        if not is_valid_target_post_url(new_url, campaign["platform"]):
+            raise HTTPException(status_code=400, detail="Invalid URL format for this platform")
+        
+        # Check for duplicates
+        existing = await db.target_urls.find_one({
+            "campaign_id": ObjectId(campaign_id),
+            "url": new_url,
+            "_id": {"$ne": ObjectId(url_id)}
+        })
+        if existing:
+            raise HTTPException(status_code=400, detail="This URL already exists in the campaign")
+        
+        update_data["url"] = new_url
+    
+    if url_update.status is not None:
+        update_data["status"] = url_update.status
+    
+    if not update_data:
+        return serialize_doc(url_doc)
+    
+    await db.target_urls.update_one(
+        {"_id": ObjectId(url_id)},
+        {"$set": update_data}
+    )
+    
+    updated = await db.target_urls.find_one({"_id": ObjectId(url_id)})
+    
+    await write_audit_log(
+        current_user["id"], current_user["username"],
+        "UPDATE", "URL", url_id,
+        old_val=url_doc["url"],
+        new_val=updated.get("url", url_doc["url"])
+    )
+    
+    return serialize_doc(updated)
+
+
+@router.delete("/{campaign_id}/urls/{url_id}")
+async def delete_url(
+    campaign_id: str,
+    url_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete a target URL"""
+    if not ObjectId.is_valid(url_id):
+        raise HTTPException(status_code=400, detail="Invalid URL ID")
+    
+    db = get_db()
+    await get_campaign_for_user(campaign_id, current_user)
+    
+    url_doc = await db.target_urls.find_one({
+        "_id": ObjectId(url_id),
+        "campaign_id": ObjectId(campaign_id)
+    })
+    
+    if not url_doc:
+        raise HTTPException(status_code=404, detail="URL not found")
+    
+    # Delete associated jobs
+    await db.jobs.delete_many({"url_id": ObjectId(url_id)})
+    
+    # Delete URL
+    await db.target_urls.delete_one({"_id": ObjectId(url_id)})
+    
+    await write_audit_log(
+        current_user["id"], current_user["username"],
+        "DELETE", "URL", url_id,
+        old_val=url_doc["url"]
+    )
+    
+    await refresh_campaign_readiness(ObjectId(campaign_id), campaign["status"])
+    
+    return {"message": "URL and associated jobs deleted successfully"}
+
+
+@router.delete("/{campaign_id}/urls/bulk-delete")
+async def bulk_delete_urls(
+    campaign_id: str,
+    status: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
+):
+    """Bulk delete URLs by status (e.g., delete all FAILED or SKIPPED URLs)"""
+    db = get_db()
+    campaign = await get_campaign_for_user(campaign_id, current_user)
+    
+    query = {"campaign_id": ObjectId(campaign_id)}
+    if status:
+        query["status"] = status
+    
+    # Get URLs to delete
+    urls_to_delete = await db.target_urls.find(query).to_list(length=1000)
+    url_ids = [url["_id"] for url in urls_to_delete]
+    
+    if not url_ids:
+        return {"message": "No URLs matched the criteria", "deleted_count": 0}
+    
+    # Delete associated jobs
+    await db.jobs.delete_many({"url_id": {"$in": url_ids}})
+    
+    # Delete URLs
+    result = await db.target_urls.delete_many({"_id": {"$in": url_ids}})
+    
+    await write_audit_log(
+        current_user["id"], current_user["username"],
+        "BULK_DELETE_URLS", "CAMPAIGN", campaign_id,
+        new_val=f"Deleted {result.deleted_count} URLs with status: {status or 'ANY'}"
+    )
+    
+    await refresh_campaign_readiness(ObjectId(campaign_id), campaign["status"])
+    
+    return {"message": f"Deleted {result.deleted_count} URLs successfully", "deleted_count": result.deleted_count}
+
+
 @router.put("/{campaign_id}/urls/{url_id}/assign-account")
 async def assign_account_to_url(
     campaign_id: str,
@@ -473,6 +669,120 @@ async def list_campaign_templates(
     cursor = db.comment_templates.find({"campaign_id": ObjectId(campaign_id)}).sort("created_at", 1)
     templates = await cursor.to_list(length=1000)
     return serialize_docs(templates)
+
+
+@router.get("/{campaign_id}/templates/{template_id}", response_model=CommentTemplateOut)
+async def get_template(
+    campaign_id: str,
+    template_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get a specific comment template"""
+    if not ObjectId.is_valid(template_id):
+        raise HTTPException(status_code=400, detail="Invalid template ID")
+    
+    db = get_db()
+    await get_campaign_for_user(campaign_id, current_user)
+    
+    template = await db.comment_templates.find_one({
+        "_id": ObjectId(template_id),
+        "campaign_id": ObjectId(campaign_id)
+    })
+    
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    
+    return serialize_doc(template)
+
+
+@router.patch("/{campaign_id}/templates/{template_id}", response_model=CommentTemplateOut)
+async def update_template(
+    campaign_id: str,
+    template_id: str,
+    template_update: CommentTemplateUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Update a comment template"""
+    if not ObjectId.is_valid(template_id):
+        raise HTTPException(status_code=400, detail="Invalid template ID")
+    
+    db = get_db()
+    await get_campaign_for_user(campaign_id, current_user)
+    
+    template = await db.comment_templates.find_one({
+        "_id": ObjectId(template_id),
+        "campaign_id": ObjectId(campaign_id)
+    })
+    
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    
+    update_data = {}
+    if template_update.content is not None:
+        update_data["content"] = template_update.content
+    if template_update.category is not None:
+        update_data["category"] = template_update.category
+    if template_update.language is not None:
+        update_data["language"] = template_update.language
+    if template_update.priority is not None:
+        update_data["priority"] = template_update.priority
+    if template_update.status is not None:
+        update_data["status"] = template_update.status
+    
+    if not update_data:
+        return serialize_doc(template)
+    
+    await db.comment_templates.update_one(
+        {"_id": ObjectId(template_id)},
+        {"$set": update_data}
+    )
+    
+    updated = await db.comment_templates.find_one({"_id": ObjectId(template_id)})
+    
+    await write_audit_log(
+        current_user["id"], current_user["username"],
+        "UPDATE", "TEMPLATE", template_id,
+        old_val=template["content"][:50],
+        new_val=updated["content"][:50]
+    )
+    
+    await refresh_campaign_readiness(ObjectId(campaign_id), await db.campaigns.find_one({"_id": ObjectId(campaign_id)}) and (await db.campaigns.find_one({"_id": ObjectId(campaign_id)})).get("status"))
+    
+    return serialize_doc(updated)
+
+
+@router.delete("/{campaign_id}/templates/{template_id}")
+async def delete_template(
+    campaign_id: str,
+    template_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete a comment template"""
+    if not ObjectId.is_valid(template_id):
+        raise HTTPException(status_code=400, detail="Invalid template ID")
+    
+    db = get_db()
+    await get_campaign_for_user(campaign_id, current_user)
+    
+    template = await db.comment_templates.find_one({
+        "_id": ObjectId(template_id),
+        "campaign_id": ObjectId(campaign_id)
+    })
+    
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    
+    await db.comment_templates.delete_one({"_id": ObjectId(template_id)})
+    
+    await write_audit_log(
+        current_user["id"], current_user["username"],
+        "DELETE", "TEMPLATE", template_id,
+        old_val=template["content"][:50]
+    )
+    
+    await refresh_campaign_readiness(ObjectId(campaign_id), await db.campaigns.find_one({"_id": ObjectId(campaign_id)}) and (await db.campaigns.find_one({"_id": ObjectId(campaign_id)})).get("status"))
+    
+    return {"message": "Template deleted successfully"}
 
 
 @router.post("/{campaign_id}/start")

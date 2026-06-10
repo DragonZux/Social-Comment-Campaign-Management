@@ -1,6 +1,7 @@
-﻿"use client";
+"use client";
 
 import { useState, useEffect, useRef } from "react";
+import Pagination from "../../../components/Pagination";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8099";
 
@@ -115,6 +116,10 @@ const parseCommentTemplates = (value) => {
 
 export default function Campaigns() {
   const [campaigns, setCampaigns] = useState([]);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [limit, setLimit] = useState(10);
+  const [totalItems, setTotalItems] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
   const [selectedCampaign, setSelectedCampaign] = useState(null);
   const [campaignUrls, setCampaignUrls] = useState([]);
   const [campaignTemplates, setCampaignTemplates] = useState([]);
@@ -182,12 +187,24 @@ export default function Campaigns() {
 
   const loadCampaigns = async () => {
     try {
-      const list = await apiFetch("/api/campaigns");
-      setCampaigns(list);
+      const data = await apiFetch(`/api/campaigns?page=${currentPage}&limit=${limit}`);
+      if (data && data.items) {
+        setCampaigns(data.items);
+        setTotalItems(data.total);
+        setTotalPages(data.pages);
+      } else {
+        setCampaigns(Array.isArray(data) ? data : []);
+        setTotalItems(Array.isArray(data) ? data.length : 0);
+        setTotalPages(1);
+      }
     } catch (err) {
       console.warn(err);
     }
   };
+
+  useEffect(() => {
+    loadCampaigns();
+  }, [currentPage, limit]);
 
   const loadDetails = async (campaign) => {
     selectedCampaignIdRef.current = campaign.id;
@@ -216,10 +233,6 @@ export default function Campaigns() {
       console.warn(err);
     }
   };
-
-  useEffect(() => {
-    loadCampaigns();
-  }, []);
 
   // Poll selected campaign details to show real-time URL and Job updates
   useEffect(() => {
@@ -571,6 +584,13 @@ export default function Campaigns() {
             ))}
           </div>
         )}
+        <Pagination
+          page={currentPage}
+          limit={limit}
+          total={totalItems}
+          pages={totalPages}
+          onPageChange={setCurrentPage}
+        />
       </div>
 
       {/* Right Col: Details View */}

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from bson import ObjectId
-from datetime import datetime
-from typing import List
+from datetime import datetime, timedelta
+from typing import List, Optional
 import asyncio
 import shlex
 
@@ -11,6 +11,49 @@ from app.api.routes.auth import get_current_user, write_audit_log
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/accounts", tags=["Social Accounts"])
+
+
+async def check_and_reset_limits(account: dict) -> dict:
+    """Reset hourly/daily usage counters if the time window has passed.
+    Updates the database and returns the updated account dict."""
+    now = datetime.utcnow()
+    last_act = account.get("last_activity")
+    if isinstance(last_act, str):
+        try:
+            if last_act.endswith("Z"):
+                last_act = last_act[:-1] + "+00:00"
+            from datetime import timezone
+            dt = datetime.fromisoformat(last_act)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            last_act = dt
+        except Exception:
+            last_act = None
+
+    if not isinstance(last_act, datetime):
+        return account
+
+    update_fields = {}
+
+    if last_act.hour != now.hour or (now - last_act) > timedelta(hours=1):
+        update_fields["hourly_usage_count"] = 0
+        account["hourly_usage_count"] = 0
+
+    if last_act.day != now.day or (now - last_act) > timedelta(days=1):
+        update_fields["daily_usage_count"] = 0
+        account["daily_usage_count"] = 0
+
+    if update_fields:
+        if account.get("status") == "LIMITED":
+            update_fields["status"] = "ACTIVE"
+            account["status"] = "ACTIVE"
+        db = get_db()
+        await db.accounts.update_one(
+            {"_id": account["_id"]},
+            {"$set": update_fields}
+        )
+
+    return account
 
 
 def account_scope(current_user: dict) -> dict:
@@ -76,12 +119,15 @@ async def create_account(
     
     return serialize_doc(account_doc)
 
-@router.get("", response_model=List[AccountOut])
+@router.get("")
 async def list_accounts(
     platform: str = None,
     status: str = None,
+    page: Optional[int] = None,
+    limit: Optional[int] = None,
     current_user: dict = Depends(get_current_user)
 ):
+    import math
     db = get_db()
     query = {}
     query.update(account_scope(current_user))
@@ -90,9 +136,25 @@ async def list_accounts(
     if status:
         query["status"] = status
         
-    cursor = db.accounts.find(query).sort("created_at", -1)
-    accounts = await cursor.to_list(length=100)
-    return serialize_docs(accounts)
+    if page is not None and limit is not None:
+        total = await db.accounts.count_documents(query)
+        cursor = db.accounts.find(query).sort("created_at", -1).skip((page - 1) * limit).limit(limit)
+        accounts = await cursor.to_list(length=limit)
+        for i, acc in enumerate(accounts):
+            accounts[i] = await check_and_reset_limits(acc)
+        return {
+            "items": serialize_docs(accounts),
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "pages": math.ceil(total / limit) if limit > 0 else 1
+        }
+    else:
+        cursor = db.accounts.find(query).sort("created_at", -1)
+        accounts = await cursor.to_list(length=100)
+        for i, acc in enumerate(accounts):
+            accounts[i] = await check_and_reset_limits(acc)
+        return serialize_docs(accounts)
 
 @router.get("/{account_id}", response_model=AccountOut)
 async def get_account(
@@ -100,6 +162,7 @@ async def get_account(
     current_user: dict = Depends(get_current_user)
 ):
     account = await get_account_for_user(account_id, current_user)
+    account = await check_and_reset_limits(account)
     return serialize_doc(account)
 
 
@@ -209,6 +272,115 @@ async def auto_login_account(
     )
 
     return {"message": "Auto-login started (backend)."}
+
+@router.post("/{account_id}/refresh-cookie")
+async def refresh_cookie(
+    account_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Refresh the account's cookies by using Playwright to visit the platform
+    and extract fresh cookies. For Threads accounts with access_token, refreshes
+    the token via Meta's Graph API instead."""
+    if not ObjectId.is_valid(account_id):
+        raise HTTPException(status_code=400, detail="Invalid account ID")
+
+    db = get_db()
+    account = await get_account_for_user(account_id, current_user)
+
+    platform = account.get("platform")
+    username = account.get("username", "")
+    cookie_str = account.get("cookie")
+    access_token = account.get("access_token")
+    proxy = account.get("proxy")
+
+    # For Threads with access_token: refresh via Meta API
+    if platform == "Threads" and access_token and len(access_token) > 20 and not access_token.lower().startswith("mock"):
+        from app.services.social_mock import refresh_threads_access_token
+        try:
+            result = await refresh_threads_access_token(access_token, proxy=proxy)
+            new_token = result["access_token"]
+            expires_in = result.get("expires_in", 0)
+
+            await db.accounts.update_one(
+                {"_id": ObjectId(account_id)},
+                {"$set": {
+                    "access_token": new_token,
+                    "status": "ACTIVE",
+                    "health_score": 100,
+                    "error_message": None,
+                }}
+            )
+
+            await write_audit_log(
+                current_user["id"], current_user["username"],
+                "REFRESH_TOKEN", "ACCOUNT", account_id,
+                new_val=f"Threads access token refreshed. Expires in {expires_in}s"
+            )
+
+            expires_days = expires_in // 86400 if expires_in else 0
+            return {
+                "success": True,
+                "type": "access_token",
+                "message": f"✅ Đã refresh Access Token thành công cho @{username}. Token mới có hiệu lực {expires_days} ngày.",
+                "expires_in": expires_in,
+            }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    # For cookie-based accounts: refresh via Playwright
+    if not cookie_str or len(cookie_str) <= 20:
+        raise HTTPException(
+            status_code=400,
+            detail="Tài khoản chưa cấu hình Cookie. Vui lòng thêm cookie trước khi refresh."
+        )
+
+    from app.services.social_mock import refresh_account_cookies, SocialAuthError
+    try:
+        result = await refresh_account_cookies(
+            platform=platform,
+            cookie_str=cookie_str,
+            username=username,
+            proxy=proxy,
+        )
+
+        # Save the refreshed cookie to database
+        await db.accounts.update_one(
+            {"_id": ObjectId(account_id)},
+            {"$set": {
+                "cookie": result["new_cookie"],
+                "status": "ACTIVE",
+                "health_score": 100,
+                "error_message": None,
+            }}
+        )
+
+        await write_audit_log(
+            current_user["id"], current_user["username"],
+            "REFRESH_COOKIE", "ACCOUNT", account_id,
+            new_val=f"Cookie refreshed: {result['cookie_count']} cookies, {len(result['changed_keys'])} changed"
+        )
+
+        return {
+            "success": True,
+            "type": "cookie",
+            "message": result["message"],
+            "cookie_count": result["cookie_count"],
+            "changed_keys": result["changed_keys"],
+            "new_keys": result["new_keys"],
+        }
+    except SocialAuthError as e:
+        # Cookie expired - update account status
+        await db.accounts.update_one(
+            {"_id": ObjectId(account_id)},
+            {"$set": {
+                "status": "ERROR",
+                "health_score": max(0, account.get("health_score", 100) - 30),
+                "error_message": str(e),
+            }}
+        )
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.patch("/{account_id}", response_model=AccountOut)
 async def update_account(

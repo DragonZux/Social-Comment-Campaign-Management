@@ -71,6 +71,11 @@ class TargetURLOut(BaseModel):
     error_message: Optional[str] = None
 
 
+class TargetURLUpdate(BaseModel):
+    url: Optional[str] = None
+    status: Optional[str] = Field(None, pattern="^(PENDING|PROCESSING|SUCCESS|FAILED|SKIPPED)$")
+
+
 class AssignAccountToURL(BaseModel):
     account_id: Optional[str] = None  # None means unassign
 
@@ -78,6 +83,14 @@ class AssignAccountToURL(BaseModel):
 
 class CommentTemplateImport(BaseModel):
     templates: List[str]
+
+
+class CommentTemplateUpdate(BaseModel):
+    content: Optional[str] = None
+    category: Optional[str] = None
+    language: Optional[str] = None
+    priority: Optional[str] = None
+    status: Optional[str] = Field(None, pattern="^(ACTIVE|INACTIVE)$")
 
 
 class CommentTemplateOut(BaseModel):

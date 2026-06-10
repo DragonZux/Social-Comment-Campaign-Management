@@ -8,6 +8,7 @@ import shlex
 from app.db.database import get_db
 from app.schemas import AccountCreate, AccountUpdate, AccountOut, serialize_doc, serialize_docs
 from app.api.routes.auth import get_current_user, write_audit_log
+from app.services.queue_service import queue_service
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/accounts", tags=["Social Accounts"])
@@ -272,6 +273,51 @@ async def auto_login_account(
     )
 
     return {"message": "Auto-login started (backend)."}
+
+class BulkRefreshIn(BaseModel):
+    account_ids: List[str]
+
+@router.post("/bulk-refresh")
+async def bulk_refresh_accounts(
+    body: BulkRefreshIn,
+    current_user: dict = Depends(get_current_user)
+):
+    """Queue background account refresh for multiple accounts."""
+    db = get_db()
+    owner_id = ObjectId(current_user["id"])
+    
+    valid_oids = []
+    for aid in body.account_ids:
+        if ObjectId.is_valid(aid):
+            valid_oids.append(ObjectId(aid))
+            
+    if not valid_oids:
+        raise HTTPException(status_code=400, detail="Không có Account ID nào hợp lệ.")
+
+    # 1. Update status to 'REFRESHING' in MongoDB for accounts owned by current user
+    await db.accounts.update_many(
+        {"_id": {"$in": valid_oids}, "owner_id": owner_id},
+        {"$set": {"status": "REFRESHING", "error_message": None}}
+    )
+    
+    # 2. Get the actual list of matched/updated account IDs and push to Redis queue
+    cursor = db.accounts.find({"_id": {"$in": valid_oids}, "owner_id": owner_id}, {"_id": 1})
+    matched_accounts = await cursor.to_list(length=len(valid_oids))
+    
+    for acc in matched_accounts:
+        await queue_service.enqueue_refresh_task(str(acc["_id"]))
+        
+    await write_audit_log(
+        current_user["id"], current_user["username"],
+        "BULK_REFRESH", "ACCOUNT", "ALL",
+        new_val=f"Enqueued bulk refresh for {len(matched_accounts)} accounts"
+    )
+    
+    return {
+        "success": True,
+        "message": f"Đang tiến hành làm mới {len(matched_accounts)} tài khoản trong nền.",
+        "enqueued_count": len(matched_accounts)
+    }
 
 @router.post("/{account_id}/refresh-cookie")
 async def refresh_cookie(

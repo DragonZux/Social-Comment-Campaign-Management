@@ -23,6 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger("worker")
 
 IMMEDIATE_QUEUE = "campaign_jobs_queue"
+REFRESH_QUEUE = "account_refresh_queue"
 SCHEDULED_QUEUE = "campaign_jobs_scheduled"
 ACCOUNT_COMMENT_COOLDOWN_SECONDS = 45
 
@@ -102,6 +103,7 @@ class Worker:
         self.db = None
         self.running = True
         self.last_monitor_check = 0.0
+        self.refresh_sem = asyncio.Semaphore(2)
 
     async def connect(self):
         logger.info(f"Connecting to MongoDB at {settings.MONGODB_URL}")
@@ -654,9 +656,6 @@ class Worker:
         existing_urls = [doc["url"] for doc in existing_url_docs]
         existing_url_set = set(existing_urls)
         
-        # Use first valid account for scraping
-        test_account = valid_accounts[0]
-        
         # Fetch templates
         templates = await db.comment_templates.find(
             {"campaign_id": campaign_id, "status": "ACTIVE"}
@@ -677,29 +676,43 @@ class Worker:
             if acc_id_str in assigned_counts:
                 assigned_counts[acc_id_str] += 1
 
+        # Concurrent Polling with Semaphore & Account Rotation (Option 2)
+        MAX_CONCURRENT_MONITOR_SCANS = 10
+        sem = asyncio.Semaphore(MAX_CONCURRENT_MONITOR_SCANS)
+
+        async def fetch_latest_for_url(page_index, page_url):
+            async with sem:
+                source_existing_urls = [
+                    doc["url"]
+                    for doc in existing_url_docs
+                    if doc.get("monitor_source_url") == page_url
+                ]
+                # Rotate account used for cào to distribute the requests across all valid accounts
+                scraper_account = valid_accounts[page_index % len(valid_accounts)]
+                try:
+                    latest_post = await mock_fetch_latest_post(
+                        platform,
+                        page_url,
+                        source_existing_urls,
+                        cookie_str=scraper_account.get("cookie"),
+                        proxy=scraper_account.get("proxy"),
+                        allow_real_fallback=False,
+                    )
+                    return page_url, latest_post
+                except Exception as e:
+                    logger.warning(f"Cannot fetch latest post for monitored source {page_url}: {e}")
+                    return page_url, None
+
+        # Execute all scans concurrently
+        tasks = [fetch_latest_for_url(idx, url) for idx, url in enumerate(page_urls)]
+        scan_results = await asyncio.gather(*tasks)
+
         new_targets = []
         scheduled_url_ids = set()
-        for page_index, page_url in enumerate(page_urls):
-            source_existing_urls = [
-                doc["url"]
-                for doc in existing_url_docs
-                if doc.get("monitor_source_url") == page_url
-            ]
-            try:
-                latest_post = await mock_fetch_latest_post(
-                    platform,
-                    page_url,
-                    source_existing_urls,
-                    cookie_str=test_account.get("cookie"),
-                    proxy=test_account.get("proxy"),
-                    allow_real_fallback=False,
-                )
-            except Exception as e:
-                logger.warning(f"Cannot fetch latest post for monitored source {page_url}: {e}")
-                continue
 
+        for page_url, latest_post in scan_results:
             if not latest_post:
-                logger.info(f"No latest post found for monitored source {page_url}")
+                logger.info(f"No latest post found or error occurred for monitored source {page_url}")
                 continue
 
             url_doc = next(
@@ -984,6 +997,103 @@ class Worker:
             except Exception as e:
                 logger.error(f"Error starting recurring campaign {campaign.get('_id')}: {e}")
 
+    async def process_account_refresh(self, account_id_str: str):
+        if not ObjectId.is_valid(account_id_str):
+            logger.error(f"Invalid account ID in refresh queue: {account_id_str}")
+            return
+
+        async with self.refresh_sem:
+            db = self.db
+            account = await db.accounts.find_one({"_id": ObjectId(account_id_str)})
+            if not account:
+                logger.error(f"Account {account_id_str} not found in database for refresh.")
+                return
+
+            platform = account.get("platform")
+            username = account.get("username", "")
+            cookie_str = account.get("cookie")
+            access_token = account.get("access_token")
+            proxy = account.get("proxy")
+
+            logger.info(f"Worker starting background refresh for @{username} ({platform})...")
+
+            # 1. Threads with official access_token
+            if platform == "Threads" and access_token and len(access_token) > 20 and not access_token.lower().startswith("mock"):
+                from app.services.social_mock import refresh_threads_access_token
+                try:
+                    result = await refresh_threads_access_token(access_token, proxy=proxy)
+                    new_token = result["access_token"]
+                    await db.accounts.update_one(
+                        {"_id": ObjectId(account_id_str)},
+                        {"$set": {
+                            "access_token": new_token,
+                            "status": "ACTIVE",
+                            "health_score": 100,
+                            "error_message": None,
+                        }}
+                    )
+                    logger.info(f"Worker successfully refreshed Threads token for @{username}.")
+                except Exception as e:
+                    logger.error(f"Worker failed to refresh Threads token for @{username}: {e}")
+                    await db.accounts.update_one(
+                        {"_id": ObjectId(account_id_str)},
+                        {"$set": {
+                            "status": "ERROR",
+                            "error_message": f"Worker refresh error: {str(e)}",
+                        }}
+                    )
+            # 2. Cookie-based accounts (X or Threads session cookie)
+            elif cookie_str and len(cookie_str) > 20 and not cookie_str.lower().startswith("mock"):
+                from app.services.social_mock import refresh_account_cookies, SocialAuthError
+                try:
+                    result = await refresh_account_cookies(
+                        platform=platform,
+                        cookie_str=cookie_str,
+                        username=username,
+                        proxy=proxy,
+                    )
+                    await db.accounts.update_one(
+                        {"_id": ObjectId(account_id_str)},
+                        {"$set": {
+                            "cookie": result["new_cookie"],
+                            "status": "ACTIVE",
+                            "health_score": 100,
+                            "error_message": None,
+                        }}
+                    )
+                    logger.info(f"Worker successfully refreshed cookie for @{username} ({platform}).")
+                except SocialAuthError as e:
+                    await db.accounts.update_one(
+                        {"_id": ObjectId(account_id_str)},
+                        {"$set": {
+                            "status": "ERROR",
+                            "health_score": max(0, account.get("health_score", 100) - 30),
+                            "error_message": str(e),
+                        }}
+                    )
+                    logger.warning(f"Worker cookie refresh failed (expired/invalid) for @{username}: {e}")
+                except Exception as e:
+                    logger.error(f"Worker failed to refresh cookies for @{username}: {e}")
+                    await db.accounts.update_one(
+                        {"_id": ObjectId(account_id_str)},
+                        {"$set": {
+                            "status": "ERROR",
+                            "error_message": f"Worker refresh error: {str(e)}",
+                        }}
+                    )
+            else:
+                # Fallback for empty/mock accounts
+                await asyncio.sleep(2)
+                await db.accounts.update_one(
+                    {"_id": ObjectId(account_id_str)},
+                    {"$set": {
+                        "status": "ACTIVE",
+                        "health_score": 100,
+                        "error_message": None,
+                    }}
+                )
+                logger.info(f"Worker simulated refresh for mock account @{username}.")
+
     async def run(self):
         await self.connect()
         await self.recover_interrupted_jobs()
@@ -999,13 +1109,17 @@ class Worker:
                     await self.check_recurring_campaigns()
 
                 await self.enqueue_due_scheduled_jobs()
-                # BLPOP block for 5 seconds waiting for next job ID
+                # BLPOP block for 5 seconds waiting for next job ID or refresh task ID
                 # Returns (queue_name, item)
-                res = await self.redis_client.blpop(IMMEDIATE_QUEUE, timeout=5)
+                res = await self.redis_client.blpop([IMMEDIATE_QUEUE, REFRESH_QUEUE], timeout=5)
                 if res:
-                    queue_name, job_id_str = res
-                    logger.info(f"Dequeued job {job_id_str} from {queue_name}")
-                    await self.process_job(job_id_str)
+                    queue_name, item_str = res
+                    if queue_name == IMMEDIATE_QUEUE:
+                        logger.info(f"Dequeued job {item_str} from {queue_name}")
+                        await self.process_job(item_str)
+                    elif queue_name == REFRESH_QUEUE:
+                        logger.info(f"Dequeued account refresh task for ID {item_str} from {queue_name}")
+                        asyncio.create_task(self.process_account_refresh(item_str))
             except Exception as e:
                 logger.error(f"Exception in worker execution loop: {e}")
                 await asyncio.sleep(2)

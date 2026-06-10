@@ -1258,43 +1258,35 @@ export default function Accounts() {
     });
 
     if (targetAccounts.length === 0) {
-      showToast("Khong tim thay tai khoan " + (platformType === "ALL" ? "" : platformType + " ") + "nao co cookie/token de refresh.", "error");
+      showToast("Không tìm thấy tài khoản " + (platformType === "ALL" ? "" : platformType + " ") + "nào có cookie/token để refresh.", "error");
       return;
     }
 
-    if (!confirm("Ban co chac chan muon refresh cho tat ca " + targetAccounts.length + " tai khoan " + (platformType === "ALL" ? "" : platformType) + "? Cac trinh duyet se duoc chay tuan tu.")) {
+    if (!confirm("Bạn có chắc chắn muốn làm mới hàng loạt cho " + targetAccounts.length + " tài khoản " + (platformType === "ALL" ? "" : platformType) + "? Các tài khoản sẽ được hàng đợi backend xử lý ngầm.")) {
       return;
     }
 
     setBulkRefreshing(true);
-    let successCount = 0;
-    let failCount = 0;
+    setBulkRefreshProgress("Đang gửi yêu cầu làm mới hàng loạt...");
 
-    for (let i = 0; i < targetAccounts.length; i++) {
-      const acc = targetAccounts[i];
-      const progressMsg = "Dang refresh @" + acc.username + " (" + (i + 1) + "/" + targetAccounts.length + ")...";
-      setBulkRefreshProgress(progressMsg);
-      showToast(progressMsg, "success");
-
-      try {
-        const result = await apiFetch("/api/accounts/" + acc.id + "/refresh-cookie", {
-          method: "POST"
-        });
-        if (result.success) {
-          successCount++;
-        } else {
-          failCount++;
-        }
-      } catch (err) {
-        failCount++;
+    try {
+      const targetIds = targetAccounts.map(acc => acc.id);
+      const result = await apiFetch("/api/accounts/bulk-refresh", {
+        method: "POST",
+        body: JSON.stringify({ account_ids: targetIds })
+      });
+      if (result.success) {
+        showToast(result.message || `Đang làm mới ${targetIds.length} tài khoản trong nền.`, "success");
+      } else {
+        showToast(result.message || "Không thể thực hiện làm mới hàng loạt.", "error");
       }
+    } catch (err) {
+      showToast(err.message || "Gặp lỗi khi gửi yêu cầu làm mới hàng loạt.", "error");
+    } finally {
+      setBulkRefreshing(false);
+      setBulkRefreshProgress("");
       loadAccounts();
     }
-
-    setBulkRefreshing(false);
-    setBulkRefreshProgress("");
-    showToast("Hoan tat refresh hang loat: " + successCount + " thanh cong, " + failCount + " that bai.", "success");
-    loadAccounts();
   };
 
   const checkConnection = async (accountId, platform, username) => {
@@ -1631,9 +1623,19 @@ export default function Accounts() {
                       ? "text-[#F59E0B]" 
                       : acc.status === "ERROR"
                       ? "text-red-500"
+                      : acc.status === "REFRESHING"
+                      ? "text-[#3B82F6]"
                       : "text-red-650"
                   }`}>
-                    {acc.status === "ACTIVE" ? "Hoạt động" : acc.status === "LIMITED" ? "Bị giới hạn" : acc.status === "ERROR" ? "Lỗi kết nối" : acc.status} ({acc.health_score}%)
+                    {acc.status === "ACTIVE" 
+                      ? "Hoạt động" 
+                      : acc.status === "LIMITED" 
+                      ? "Bị giới hạn" 
+                      : acc.status === "ERROR" 
+                      ? "Lỗi kết nối" 
+                      : acc.status === "REFRESHING"
+                      ? "Đang làm mới..."
+                      : acc.status} ({acc.health_score}%)
                   </span>
                 </div>
                 {/* Health Bar */}
@@ -1729,10 +1731,10 @@ export default function Accounts() {
                     <div className="flex items-center gap-2">
                       <button
                         onClick={() => handleRefreshCookie(acc.id)}
-                        disabled={refreshingId === acc.id || bulkRefreshing || (!acc.has_cookie && !acc.has_access_token)}
+                        disabled={refreshingId === acc.id || acc.status === "REFRESHING" || bulkRefreshing || (!acc.has_cookie && !acc.has_access_token)}
                         className="flex-1 h-10 bg-orange-50 hover:bg-orange-100 border border-orange-200 text-orange-600 font-extrabold rounded-md transition-all duration-200 hover:scale-[1.02] flex items-center justify-center space-x-1.5 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed text-xs"
                       >
-                        {refreshingId === acc.id ? (
+                        {refreshingId === acc.id || acc.status === "REFRESHING" ? (
                           <>
                             <svg className="animate-spin -ml-1 mr-1 h-3.5 w-3.5 text-orange-600" fill="none" viewBox="0 0 24 24">
                               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth={4} />

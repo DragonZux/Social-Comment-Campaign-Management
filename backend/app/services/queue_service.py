@@ -23,6 +23,11 @@ class QueueService:
         await self.redis_client.rpush("campaign_jobs_queue", job_id)
         logger.debug(f"Enqueued job {job_id} to Redis")
 
+    async def enqueue_refresh_task(self, account_id: str):
+        await self.connect()
+        await self.redis_client.rpush("account_refresh_queue", account_id)
+        logger.debug(f"Enqueued account refresh for {account_id} to Redis")
+
     async def schedule_job(self, job_id: str, run_at_timestamp: float):
         await self.connect()
         await self.redis_client.zadd("campaign_jobs_scheduled", {job_id: run_at_timestamp})

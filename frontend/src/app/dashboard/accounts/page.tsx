@@ -756,6 +756,39 @@ export default function Accounts() {
   const [postText, setPostText] = useState("");
   const [postingId, setPostingId] = useState(null);
 
+  // Confirmation Modal States
+  const [showConfirmModal, setShowConfirmModal] = useState(false);
+  const [confirmTitle, setConfirmTitle] = useState("");
+  const [confirmMessage, setConfirmMessage] = useState("");
+  const [confirmType, setConfirmType] = useState("info");
+  const [confirmResolver, setConfirmResolver] = useState(null);
+
+  const requestConfirm = (title, message, type = "info") => {
+    return new Promise((resolve) => {
+      setConfirmTitle(title);
+      setConfirmMessage(message);
+      setConfirmType(type);
+      setShowConfirmModal(true);
+      setConfirmResolver(() => resolve);
+    });
+  };
+
+  const handleConfirmAccept = () => {
+    setShowConfirmModal(false);
+    if (confirmResolver) {
+      confirmResolver(true);
+      setConfirmResolver(null);
+    }
+  };
+
+  const handleConfirmCancel = () => {
+    setShowConfirmModal(false);
+    if (confirmResolver) {
+      confirmResolver(false);
+      setConfirmResolver(null);
+    }
+  };
+
   const [toasts, setToasts] = useState([]);
 
   const handleMultipleFilesChangeLegacy = async (e: any) => {
@@ -1220,7 +1253,12 @@ export default function Accounts() {
   };
 
   const deleteAccount = async (aid) => {
-    if (!confirm("Bạn có chắc chắn muốn xóa tài khoản mạng xã hội này? Tất cả dữ liệu liên quan sẽ bị xóa.")) return;
+    const confirmed = await requestConfirm(
+      "Xác nhận xóa tài khoản",
+      "Bạn có chắc chắn muốn xóa tài khoản mạng xã hội này? Tất cả dữ liệu liên quan sẽ bị xóa.",
+      "danger"
+    );
+    if (!confirmed) return;
     try {
       await apiFetch(`/api/accounts/${aid}`, { method: "DELETE" });
       showToast("Đã xóa tài khoản khỏi hệ thống.", "error");
@@ -1258,35 +1296,46 @@ export default function Accounts() {
     });
 
     if (targetAccounts.length === 0) {
-      showToast("Không tìm thấy tài khoản " + (platformType === "ALL" ? "" : platformType + " ") + "nào có cookie/token để refresh.", "error");
+      showToast("Khong tim thay tai khoan " + (platformType === "ALL" ? "" : platformType + " ") + "nao co cookie/token de refresh.", "error");
       return;
     }
 
-    if (!confirm("Bạn có chắc chắn muốn làm mới hàng loạt cho " + targetAccounts.length + " tài khoản " + (platformType === "ALL" ? "" : platformType) + "? Các tài khoản sẽ được hàng đợi backend xử lý ngầm.")) {
-      return;
-    }
+    const confirmed = await requestConfirm(
+      "Xác nhận làm mới hàng loạt",
+      "Bạn có chắc chắn muốn refresh cho tất cả " + targetAccounts.length + " tài khoản " + (platformType === "ALL" ? "" : platformType) + "? Các trình duyệt sẽ được chạy lần lượt và tuần tự.",
+      "warning"
+    );
+    if (!confirmed) return;
 
     setBulkRefreshing(true);
-    setBulkRefreshProgress("Đang gửi yêu cầu làm mới hàng loạt...");
+    let successCount = 0;
+    let failCount = 0;
 
-    try {
-      const targetIds = targetAccounts.map(acc => acc.id);
-      const result = await apiFetch("/api/accounts/bulk-refresh", {
-        method: "POST",
-        body: JSON.stringify({ account_ids: targetIds })
-      });
-      if (result.success) {
-        showToast(result.message || `Đang làm mới ${targetIds.length} tài khoản trong nền.`, "success");
-      } else {
-        showToast(result.message || "Không thể thực hiện làm mới hàng loạt.", "error");
+    for (let i = 0; i < targetAccounts.length; i++) {
+      const acc = targetAccounts[i];
+      const progressMsg = "Dang refresh @" + acc.username + " (" + (i + 1) + "/" + targetAccounts.length + ")...";
+      setBulkRefreshProgress(progressMsg);
+      showToast(progressMsg, "success");
+
+      try {
+        const result = await apiFetch("/api/accounts/" + acc.id + "/refresh-cookie", {
+          method: "POST"
+        });
+        if (result.success) {
+          successCount++;
+        } else {
+          failCount++;
+        }
+      } catch (err) {
+        failCount++;
       }
-    } catch (err) {
-      showToast(err.message || "Gặp lỗi khi gửi yêu cầu làm mới hàng loạt.", "error");
-    } finally {
-      setBulkRefreshing(false);
-      setBulkRefreshProgress("");
       loadAccounts();
     }
+
+    setBulkRefreshing(false);
+    setBulkRefreshProgress("");
+    showToast("Hoan tat refresh hang loat: " + successCount + " thanh cong, " + failCount + " that bai.", "success");
+    loadAccounts();
   };
 
   const checkConnection = async (accountId, platform, username) => {
@@ -1623,19 +1672,9 @@ export default function Accounts() {
                       ? "text-[#F59E0B]" 
                       : acc.status === "ERROR"
                       ? "text-red-500"
-                      : acc.status === "REFRESHING"
-                      ? "text-[#3B82F6]"
                       : "text-red-650"
                   }`}>
-                    {acc.status === "ACTIVE" 
-                      ? "Hoạt động" 
-                      : acc.status === "LIMITED" 
-                      ? "Bị giới hạn" 
-                      : acc.status === "ERROR" 
-                      ? "Lỗi kết nối" 
-                      : acc.status === "REFRESHING"
-                      ? "Đang làm mới..."
-                      : acc.status} ({acc.health_score}%)
+                    {acc.status === "ACTIVE" ? "Hoạt động" : acc.status === "LIMITED" ? "Bị giới hạn" : acc.status === "ERROR" ? "Lỗi kết nối" : acc.status} ({acc.health_score}%)
                   </span>
                 </div>
                 {/* Health Bar */}
@@ -1731,10 +1770,10 @@ export default function Accounts() {
                     <div className="flex items-center gap-2">
                       <button
                         onClick={() => handleRefreshCookie(acc.id)}
-                        disabled={refreshingId === acc.id || acc.status === "REFRESHING" || bulkRefreshing || (!acc.has_cookie && !acc.has_access_token)}
+                        disabled={refreshingId === acc.id || bulkRefreshing || (!acc.has_cookie && !acc.has_access_token)}
                         className="flex-1 h-10 bg-orange-50 hover:bg-orange-100 border border-orange-200 text-orange-600 font-extrabold rounded-md transition-all duration-200 hover:scale-[1.02] flex items-center justify-center space-x-1.5 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed text-xs"
                       >
-                        {refreshingId === acc.id || acc.status === "REFRESHING" ? (
+                        {refreshingId === acc.id ? (
                           <>
                             <svg className="animate-spin -ml-1 mr-1 h-3.5 w-3.5 text-orange-600" fill="none" viewBox="0 0 24 24">
                               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth={4} />
@@ -2652,6 +2691,85 @@ https://www.threads.net/@lifestyle_vlog sessionid=...
                   ⚡ Đang chạy trình duyệt ảo để đăng bài, vui lòng đợi 10-15 giây...
                 </span>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CUSTOM CONFIRMATION MODAL */}
+      {showConfirmModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm animate-fade-in">
+          <div className="relative w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl border border-gray-150 animate-slide-up space-y-5">
+            {/* Close button */}
+            <button
+              type="button"
+              onClick={handleConfirmCancel}
+              className="absolute top-4 right-4 text-gray-400 hover:text-gray-600 transition-colors p-1 rounded-full hover:bg-gray-100 cursor-pointer"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+
+            <div className="flex items-start gap-4">
+              {/* Dynamic Icon */}
+              <div className={`shrink-0 flex items-center justify-center w-12 h-12 rounded-full ${
+                confirmType === "danger" 
+                  ? "bg-rose-50 text-rose-600" 
+                  : confirmType === "warning" 
+                  ? "bg-amber-50 text-amber-600" 
+                  : "bg-blue-50 text-blue-600"
+              }`}>
+                {confirmType === "danger" && (
+                  <svg className="w-6 h-6 animate-pulse" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                  </svg>
+                )}
+                {confirmType === "warning" && (
+                  <svg className="w-6 h-6 animate-pulse" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                  </svg>
+                )}
+                {confirmType === "info" && (
+                  <svg className="w-6 h-6 animate-pulse" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                )}
+              </div>
+
+              {/* Title & Content */}
+              <div className="space-y-1.5 flex-1 min-w-0 pr-6">
+                <h3 className="text-sm font-extrabold text-gray-900 leading-6 uppercase tracking-tight">
+                  {confirmTitle}
+                </h3>
+                <p className="text-xs font-semibold text-gray-500 leading-relaxed whitespace-pre-line">
+                  {confirmMessage}
+                </p>
+              </div>
+            </div>
+
+            {/* Action Buttons */}
+            <div className="flex items-center justify-end gap-3 pt-1">
+              <button
+                type="button"
+                onClick={handleConfirmCancel}
+                className="px-4 py-2.5 rounded-xl border border-gray-200 bg-white hover:bg-gray-50 text-xs font-bold text-gray-700 hover:text-gray-900 transition-all cursor-pointer shadow-sm min-w-[80px]"
+              >
+                Huỷ
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmAccept}
+                className={`px-5 py-2.5 rounded-xl text-xs font-extrabold text-white transition-all hover:scale-[1.03] cursor-pointer shadow-md min-w-[100px] ${
+                  confirmType === "danger"
+                    ? "bg-rose-600 hover:bg-rose-700 shadow-rose-600/10"
+                    : confirmType === "warning"
+                    ? "bg-amber-600 hover:bg-amber-700 shadow-amber-600/10"
+                    : "bg-blue-600 hover:bg-blue-700 shadow-blue-600/10"
+                }`}
+              >
+                Xác nhận
+              </button>
             </div>
           </div>
         </div>

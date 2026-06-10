@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import Pagination from "../../../components/Pagination";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8099";
 
@@ -696,6 +697,11 @@ export default function Accounts() {
   const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
 
+  const [currentPage, setCurrentPage] = useState(1);
+  const [limit, setLimit] = useState(9);
+  const [totalItems, setTotalItems] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
+
   // Add Form Modal State
   const [showAddModal, setShowAddModal] = useState(false);
   const [newPlatform, setNewPlatform] = useState("X");
@@ -737,6 +743,9 @@ export default function Accounts() {
   const [editHourlyLimit, setEditHourlyLimit] = useState(5);
   const [checkingId, setCheckingId] = useState(null);
   const [loginLoadingId, setLoginLoadingId] = useState(null);
+  const [refreshingId, setRefreshingId] = useState(null);
+  const [bulkRefreshing, setBulkRefreshing] = useState(false);
+  const [bulkRefreshProgress, setBulkRefreshProgress] = useState("");
   const [showLoginScriptModal, setShowLoginScriptModal] = useState(false);
   const [loginScriptContent, setLoginScriptContent] = useState("");
   const [loginScriptProfileUrl, setLoginScriptProfileUrl] = useState("");
@@ -1023,8 +1032,16 @@ export default function Accounts() {
 
   const loadAccounts = async () => {
     try {
-      const list = await apiFetch("/api/accounts");
-      setAccounts(list);
+      const data = await apiFetch(`/api/accounts?page=${currentPage}&limit=${limit}`);
+      if (data && data.items) {
+        setAccounts(data.items);
+        setTotalItems(data.total);
+        setTotalPages(data.pages);
+      } else {
+        setAccounts(Array.isArray(data) ? data : []);
+        setTotalItems(Array.isArray(data) ? data.length : 0);
+        setTotalPages(1);
+      }
     } catch (err) {
       console.warn(err);
     } finally {
@@ -1034,7 +1051,7 @@ export default function Accounts() {
 
   useEffect(() => {
     loadAccounts();
-  }, []);
+  }, [currentPage, limit]);
 
   const handleCreate = async (e) => {
     e.preventDefault();
@@ -1213,6 +1230,73 @@ export default function Accounts() {
     }
   };
 
+  const handleRefreshCookie = async (accountId) => {
+    setRefreshingId(accountId);
+    try {
+      const result = await apiFetch(`/api/accounts/${accountId}/refresh-cookie`, {
+        method: "POST"
+      });
+      if (result.success) {
+        showToast(result.message, "success");
+      } else {
+        showToast(result.message || "Refresh thất bại.", "error");
+      }
+      loadAccounts();
+    } catch (err) {
+      showToast(err.message || "Không thể refresh cookie.", "error");
+      loadAccounts();
+    } finally {
+      setRefreshingId(null);
+    }
+  };
+
+  const handleBulkRefresh = async (platformType) => {
+    const targetAccounts = accounts.filter(acc => {
+      const matchPlatform = platformType === "ALL" || acc.platform === platformType;
+      const refreshable = acc.has_cookie || acc.has_access_token;
+      return matchPlatform && refreshable;
+    });
+
+    if (targetAccounts.length === 0) {
+      showToast("Khong tim thay tai khoan " + (platformType === "ALL" ? "" : platformType + " ") + "nao co cookie/token de refresh.", "error");
+      return;
+    }
+
+    if (!confirm("Ban co chac chan muon refresh cho tat ca " + targetAccounts.length + " tai khoan " + (platformType === "ALL" ? "" : platformType) + "? Cac trinh duyet se duoc chay tuan tu.")) {
+      return;
+    }
+
+    setBulkRefreshing(true);
+    let successCount = 0;
+    let failCount = 0;
+
+    for (let i = 0; i < targetAccounts.length; i++) {
+      const acc = targetAccounts[i];
+      const progressMsg = "Dang refresh @" + acc.username + " (" + (i + 1) + "/" + targetAccounts.length + ")...";
+      setBulkRefreshProgress(progressMsg);
+      showToast(progressMsg, "success");
+
+      try {
+        const result = await apiFetch("/api/accounts/" + acc.id + "/refresh-cookie", {
+          method: "POST"
+        });
+        if (result.success) {
+          successCount++;
+        } else {
+          failCount++;
+        }
+      } catch (err) {
+        failCount++;
+      }
+      loadAccounts();
+    }
+
+    setBulkRefreshing(false);
+    setBulkRefreshProgress("");
+    showToast("Hoan tat refresh hang loat: " + successCount + " thanh cong, " + failCount + " that bai.", "success");
+    loadAccounts();
+  };
+
   const checkConnection = async (accountId, platform, username) => {
     setCheckingId(accountId);
     try {
@@ -1330,15 +1414,49 @@ export default function Accounts() {
         ))}
       </div>
 
-      {/* Header bar */}
-      <div className="flex justify-between items-center pr-1 pl-1">
-        <h3 className="text-sm font-extrabold text-gray-900 uppercase tracking-wider">Tài khoản kết nối</h3>
-        <button
-          onClick={() => setShowAddModal(true)}
-          className="h-12 bg-[#3B82F6] hover:bg-blue-600 text-white font-extrabold px-5 rounded-md text-xs transition-all duration-200 hover:scale-105 cursor-pointer shadow-none"
-        >
-          + Kết nối tài khoản mạng xã hội
-        </button>
+      {/* Header bar & Bulk Actions */}
+      <div className="flex flex-col md:flex-row md:justify-between md:items-center gap-4 pr-1 pl-1 border-b border-gray-200 pb-4">
+        <div>
+          <h3 className="text-sm font-extrabold text-gray-900 uppercase tracking-wider">Tài khoản kết nối</h3>
+          {bulkRefreshing && (
+            <p className="text-xs text-orange-500 font-extrabold mt-1 animate-pulse">
+              {bulkRefreshProgress}
+            </p>
+          )}
+        </div>
+        
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Bulk Refresh Buttons */}
+          <button
+            onClick={() => handleBulkRefresh("X")}
+            disabled={bulkRefreshing || refreshingId !== null}
+            className="h-10 bg-orange-50 hover:bg-orange-100 border border-orange-200 text-orange-600 font-extrabold px-4 rounded-md text-xs transition-all duration-200 hover:scale-[1.02] disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5 cursor-pointer"
+          >
+            Bulk Refresh X
+          </button>
+          <button
+            onClick={() => handleBulkRefresh("Threads")}
+            disabled={bulkRefreshing || refreshingId !== null}
+            className="h-10 bg-orange-50 hover:bg-orange-100 border border-orange-200 text-orange-600 font-extrabold px-4 rounded-md text-xs transition-all duration-200 hover:scale-[1.02] disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5 cursor-pointer"
+          >
+            Bulk Refresh Threads
+          </button>
+          <button
+            onClick={() => handleBulkRefresh("ALL")}
+            disabled={bulkRefreshing || refreshingId !== null}
+            className="h-10 bg-orange-50 hover:bg-orange-100 border border-orange-200 text-orange-600 font-extrabold px-4 rounded-md text-xs transition-all duration-200 hover:scale-[1.02] disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5 cursor-pointer"
+          >
+            Bulk Refresh All
+          </button>
+
+          {/* Add Account Button */}
+          <button
+            onClick={() => setShowAddModal(true)}
+            className="h-10 bg-[#3B82F6] hover:bg-blue-600 text-white font-extrabold px-4 rounded-md text-xs transition-all duration-200 hover:scale-[1.02] cursor-pointer shadow-none flex items-center"
+          >
+            + Kết nối tài khoản
+          </button>
+        </div>
       </div>
 
       {/* Account Grid */}
@@ -1608,10 +1726,32 @@ export default function Accounts() {
                     </button>
                   </div>
 
-                    <div className="flex items-center">
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => handleRefreshCookie(acc.id)}
+                        disabled={refreshingId === acc.id || bulkRefreshing || (!acc.has_cookie && !acc.has_access_token)}
+                        className="flex-1 h-10 bg-orange-50 hover:bg-orange-100 border border-orange-200 text-orange-600 font-extrabold rounded-md transition-all duration-200 hover:scale-[1.02] flex items-center justify-center space-x-1.5 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed text-xs"
+                      >
+                        {refreshingId === acc.id ? (
+                          <>
+                            <svg className="animate-spin -ml-1 mr-1 h-3.5 w-3.5 text-orange-600" fill="none" viewBox="0 0 24 24">
+                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth={4} />
+                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                            </svg>
+                            <span>Đang refresh...</span>
+                          </>
+                        ) : (
+                          <>
+                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                            </svg>
+                            <span>🔄 Refresh Cookie</span>
+                          </>
+                        )}
+                      </button>
                       <button
                         onClick={() => { setShowPostModal(true); setPostAccountId(acc.id); setPostAccountPlatform(acc.platform || "X"); setPostTargetUrl(''); setPostText(''); }}
-                        className="ml-2 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-600 font-extrabold rounded-md px-3 h-10 transition-all duration-200 hover:scale-[1.02] text-xs"
+                        className="bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-600 font-extrabold rounded-md px-3 h-10 transition-all duration-200 hover:scale-[1.02] text-xs"
                       >
                         💬 Post
                       </button>
@@ -1647,6 +1787,18 @@ export default function Accounts() {
           ))
         )}
       </div>
+
+      <Pagination
+        page={currentPage}
+        limit={limit}
+        total={totalItems}
+        pages={totalPages}
+        onPageChange={setCurrentPage}
+        onLimitChange={(newLimit) => {
+          setLimit(newLimit);
+          setCurrentPage(1);
+        }}
+      />
 
       {/* ADD MODAL */}
       {showAddModal && (

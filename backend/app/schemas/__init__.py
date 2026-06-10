@@ -8,8 +8,10 @@ from app.schemas.campaigns import (
     CampaignUpdate,
     CommentTemplateImport,
     CommentTemplateOut,
+    CommentTemplateUpdate,
     TargetURLImport,
     TargetURLOut,
+    TargetURLUpdate,
 )
 from app.schemas.common import serialize_doc, serialize_docs
 from app.schemas.dashboard import DashboardMetrics
@@ -26,10 +28,12 @@ __all__ = [
     "CampaignUpdate",
     "CommentTemplateImport",
     "CommentTemplateOut",
+    "CommentTemplateUpdate",
     "DashboardMetrics",
     "JobOut",
     "TargetURLImport",
     "TargetURLOut",
+    "TargetURLUpdate",
     "Token",
     "UserLogin",
     "UserRegister",

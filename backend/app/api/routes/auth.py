@@ -128,3 +128,53 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
         "token_type": "bearer",
         "username": user["username"]
     }
+
+@router.get("/me")
+async def get_current_user_info(
+    current_user: dict = Depends(get_current_user)
+):
+    """Get current user information"""
+    return {
+        "id": current_user["id"],
+        "username": current_user["username"],
+        "created_at": current_user.get("created_at")
+    }
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str
+
+@router.post("/change-password")
+async def change_password(
+    req: ChangePasswordRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Change user password"""
+    db = get_db()
+    user = await db.users.find_one({"username": current_user["username"]})
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Verify old password
+    if not verify_password(req.old_password, user["hashed_password"]):
+        raise HTTPException(status_code=400, detail="Old password is incorrect")
+    
+    # Check if new password is different from old
+    if req.old_password == req.new_password:
+        raise HTTPException(status_code=400, detail="New password must be different from old password")
+    
+    # Hash new password
+    new_hash = get_password_hash(req.new_password)
+    
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"hashed_password": new_hash}}
+    )
+    
+    await write_audit_log(
+        str(user["_id"]), user["username"],
+        "CHANGE_PASSWORD", "USER", str(user["_id"])
+    )
+    
+    return {"message": "Password changed successfully"}

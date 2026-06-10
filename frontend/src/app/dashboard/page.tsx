@@ -1,10 +1,14 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
+import Pagination from "../../components/Pagination";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8099";
 
 export default function Dashboard() {
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 5;
+
   const [metrics, setMetrics] = useState({
     total_campaigns: 0,
     success_rate: 0.0,
@@ -47,6 +51,10 @@ export default function Dashboard() {
       if (timerRef.current) clearInterval(timerRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [filterPlatform, filterStatus, searchTerm]);
 
   if (loading) {
     return (
@@ -160,6 +168,11 @@ export default function Dashboard() {
 
     return isPlatformMatch && isStatusMatch && matchesSearch;
   });
+
+
+  const totalItems = filteredJobs.length;
+  const totalPages = Math.ceil(totalItems / itemsPerPage);
+  const paginatedJobs = filteredJobs.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
 
   return (
     <div className="space-y-6 pb-8 animate-slide-up">
@@ -404,14 +417,14 @@ export default function Dashboard() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-slate-700 font-semibold">
-              {filteredJobs.length === 0 ? (
+              {totalItems === 0 ? (
                 <tr>
                   <td colSpan={7} className="text-center py-12 text-slate-400 font-bold bg-slate-50/30">
                     Không tìm thấy tác vụ nào khớp với bộ lọc.
                   </td>
                 </tr>
               ) : (
-                filteredJobs.map((job) => {
+                paginatedJobs.map((job) => {
                   const isThreads = job.target_url?.includes("threads.net") || job.target_url?.includes("threads.com");
                   return (
                     <tr key={job.id} className="hover:bg-slate-50/50 transition-colors duration-150">
@@ -420,7 +433,7 @@ export default function Dashboard() {
                       </td>
                       <td className="py-3.5 px-4">
                         <span
-                          className={`inline-flex items-center px-2 py-0.5 rounded-md text-[9px] font-extrabold uppercase border ${
+                           className={`inline-flex items-center px-2 py-0.5 rounded-md text-[9px] font-extrabold uppercase border ${
                             isThreads
                               ? "bg-purple-50 text-purple-700 border-purple-100"
                               : "bg-slate-900 text-white border-slate-900"
@@ -493,6 +506,13 @@ export default function Dashboard() {
             </tbody>
           </table>
         </div>
+        <Pagination
+          page={currentPage}
+          limit={itemsPerPage}
+          total={totalItems}
+          pages={totalPages}
+          onPageChange={setCurrentPage}
+        />
       </div>
     </div>
   );

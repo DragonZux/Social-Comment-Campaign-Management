@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
+import Pagination from "../../../components/Pagination";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8099";
 
@@ -8,6 +9,10 @@ export default function Jobs() {
   const [jobs, setJobs] = useState([]);
   const [filterStatus, setFilterStatus] = useState("");
   const [loading, setLoading] = useState(true);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [limit, setLimit] = useState(10);
+  const [totalItems, setTotalItems] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
   const timerRef = useRef(null);
 
   const [toasts, setToasts] = useState([]);
@@ -46,9 +51,19 @@ export default function Jobs() {
 
   const fetchJobs = async () => {
     try {
-      const endpoint = filterStatus ? `/api/jobs?status=${filterStatus}` : "/api/jobs";
-      const list = await apiFetch(endpoint);
-      setJobs(list);
+      const base = filterStatus ? `/api/jobs?status=${filterStatus}` : "/api/jobs";
+      const connector = base.includes("?") ? "&" : "?";
+      const endpoint = `${base}${connector}page=${currentPage}&limit=${limit}`;
+      const data = await apiFetch(endpoint);
+      if (data && data.items) {
+        setJobs(data.items);
+        setTotalItems(data.total);
+        setTotalPages(data.pages);
+      } else {
+        setJobs(Array.isArray(data) ? data : []);
+        setTotalItems(Array.isArray(data) ? data.length : 0);
+        setTotalPages(1);
+      }
     } catch (err) {
       console.warn(err);
     } finally {
@@ -56,15 +71,29 @@ export default function Jobs() {
     }
   };
 
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [filterStatus]);
+
   // Poll job data
   useEffect(() => {
     let active = true;
     const pollJobs = async () => {
       try {
-        const endpoint = filterStatus ? `/api/jobs?status=${filterStatus}` : "/api/jobs";
-        const list = await apiFetch(endpoint);
+        const base = filterStatus ? `/api/jobs?status=${filterStatus}` : "/api/jobs";
+        const connector = base.includes("?") ? "&" : "?";
+        const endpoint = `${base}${connector}page=${currentPage}&limit=${limit}`;
+        const data = await apiFetch(endpoint);
         if (!active) return;
-        setJobs(list);
+        if (data && data.items) {
+          setJobs(data.items);
+          setTotalItems(data.total);
+          setTotalPages(data.pages);
+        } else {
+          setJobs(Array.isArray(data) ? data : []);
+          setTotalItems(Array.isArray(data) ? data.length : 0);
+          setTotalPages(1);
+        }
       } catch (err) {
         console.warn(err);
       } finally {
@@ -78,7 +107,7 @@ export default function Jobs() {
       active = false;
       clearInterval(timer);
     };
-  }, [filterStatus]);
+  }, [filterStatus, currentPage, limit]);
 
   const retryJob = async (jobId) => {
     try {
@@ -161,7 +190,7 @@ export default function Jobs() {
           ))}
         </div>
         <div className="text-xs font-extrabold uppercase tracking-wide text-gray-500 pl-1 sm:pr-1">
-          Tìm thấy **{jobs.length}** tác vụ
+          Tìm thấy **{totalItems}** tác vụ
         </div>
       </div>
 
@@ -244,6 +273,17 @@ export default function Jobs() {
             </tbody>
           </table>
         </div>
+        <Pagination
+          page={currentPage}
+          limit={limit}
+          total={totalItems}
+          pages={totalPages}
+          onPageChange={setCurrentPage}
+          onLimitChange={(newLimit) => {
+            setLimit(newLimit);
+            setCurrentPage(1);
+          }}
+        />
       </div>
 
     </div>

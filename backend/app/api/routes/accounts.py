@@ -120,6 +120,24 @@ async def create_account(
     
     return serialize_doc(account_doc)
 
+
+def prepare_account_doc(acc: dict) -> dict:
+    if not acc:
+        return acc
+    cookie_val = acc.get("cookie")
+    acc["has_cookie"] = bool(cookie_val and len(str(cookie_val).strip()) > 0)
+    
+    token_val = acc.get("access_token")
+    acc["has_access_token"] = bool(token_val and len(str(token_val).strip()) > 0)
+    
+    uid_val = acc.get("threads_user_id")
+    acc["has_threads_user_id"] = bool(uid_val and len(str(uid_val).strip()) > 0)
+    
+    proxy_val = acc.get("proxy")
+    acc["has_proxy"] = bool(proxy_val and len(str(proxy_val).strip()) > 0)
+    return acc
+
+
 @router.get("")
 async def list_accounts(
     platform: str = None,
@@ -142,7 +160,8 @@ async def list_accounts(
         cursor = db.accounts.find(query).sort("created_at", -1).skip((page - 1) * limit).limit(limit)
         accounts = await cursor.to_list(length=limit)
         for i, acc in enumerate(accounts):
-            accounts[i] = await check_and_reset_limits(acc)
+            acc = await check_and_reset_limits(acc)
+            accounts[i] = prepare_account_doc(acc)
         return {
             "items": serialize_docs(accounts),
             "total": total,
@@ -154,7 +173,8 @@ async def list_accounts(
         cursor = db.accounts.find(query).sort("created_at", -1)
         accounts = await cursor.to_list(length=100)
         for i, acc in enumerate(accounts):
-            accounts[i] = await check_and_reset_limits(acc)
+            acc = await check_and_reset_limits(acc)
+            accounts[i] = prepare_account_doc(acc)
         return serialize_docs(accounts)
 
 @router.get("/{account_id}", response_model=AccountOut)
@@ -309,7 +329,7 @@ async def bulk_refresh_accounts(
         
     await write_audit_log(
         current_user["id"], current_user["username"],
-        "BULK_REFRESH", "ACCOUNT", "ALL",
+        "BULK_REFRESH", "ACCOUNT", None,
         new_val=f"Enqueued bulk refresh for {len(matched_accounts)} accounts"
     )
     
